@@ -35,6 +35,7 @@ class T3Graph:
         
         # Position buffer
         self.cache_position = torch.zeros(1, dtype=torch.long, device=device)
+        self.position_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         
         # Attention Mask Table (pre-computed for all positions)
         self.attn_mask_table = []
@@ -53,17 +54,11 @@ class T3Graph:
 
     def _build_attention_masks(self):
         """Pre-compute causal masks for all possible positions."""
-        dummy_input = torch.zeros(self.batch_size, 1, self.tfmr.config.hidden_size, dtype=self.dtype, device=self.device)
         self.attn_mask_table = []
+        mask_val = torch.finfo(self.dtype).min
         for i in range(self.max_seq_len):
-            pos = torch.tensor([i], device=self.device)
-            mask = create_causal_mask(
-                config=self.tfmr.config,
-                input_embeds=dummy_input,
-                attention_mask=None,
-                cache_position=pos,
-                past_key_values=self.static_cache,
-            )
+            mask = torch.full((self.batch_size, 1, 1, self.max_seq_len), mask_val, device=self.device, dtype=self.dtype)
+            mask[:, :, :, :i+1] = 0
             self.attn_mask_table.append(mask)
         
         # Current active mask (static buffer for graph)
@@ -77,6 +72,7 @@ class T3Graph:
             inputs_embeds=self.input_buf,
             past_key_values=self.static_cache,
             cache_position=self.cache_position,
+            position_ids=self.position_ids,
             attention_mask=self.active_mask,
             use_cache=True,
             return_dict=True
@@ -128,16 +124,19 @@ class T3Graph:
             for li in range(num_layers):
                 k, v = past_key_values[li] # [B, heads, seq, head_dim]
                 seq_len = k.shape[2]
-                cache_pos = torch.arange(seq_len, device=self.device)
-                self.static_cache.update(k, v, li, {"cache_position": cache_pos})
+                self.static_cache.layers[li].keys[:, :, :seq_len, :].copy_(k)
+                self.static_cache.layers[li].values[:, :, :seq_len, :].copy_(v)
         else:
             # Llama style: DynamicCache (modern transformers style)
             num_layers = len(past_key_values.layers)
             for li in range(num_layers):
                 k, v = past_key_values.layers[li].keys, past_key_values.layers[li].values
                 seq_len = k.shape[2]
-                cache_pos = torch.arange(seq_len, device=self.device)
-                self.static_cache.update(k, v, li, {"cache_position": cache_pos})
+                # Direct copy into the static tensors
+                self.static_cache.layers[li].keys[:, :, :seq_len, :].copy_(k)
+                self.static_cache.layers[li].values[:, :, :seq_len, :].copy_(v)
+            
+            self.static_cache.seen_tokens = seq_len
         
         return seq_len
 
@@ -152,6 +151,7 @@ class T3Graph:
 
         self.input_buf.copy_(next_token_embed)
         self.cache_position[0] = position
+        self.position_ids.fill_(position)
         self.active_mask.copy_(self.attn_mask_table[position])
         
         self.graph.replay()

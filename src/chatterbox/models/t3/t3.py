@@ -384,7 +384,7 @@ class T3(nn.Module):
 
             # Forward pass with only the new token and the cached past.
             if self.t3_graph is not None and self.t3_graph.captured:
-                output_logits = self.t3_graph.run(next_token_embed, position=prefill_len + len(predicted))
+                output_logits = self.t3_graph.run(next_token_embed, position=prefill_len + len(predicted) - 1)
                 # For compatibility with the rest of the loop, we need an object with .logits
                 output = AttrDict(logits=output_logits)
             else:

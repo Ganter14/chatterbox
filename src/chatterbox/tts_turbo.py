@@ -9,6 +9,7 @@ import perth
 import pyloudnorm as ln
 
 from safetensors.torch import load_file
+import time
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
@@ -300,3 +301,86 @@ class ChatterboxTurboTTS:
         wav = wav.squeeze(0).detach().cpu().numpy()
         watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+    def generate_streaming(
+        self,
+        text,
+        repetition_penalty=1.2,
+        min_p=0.00,
+        top_p=0.95,
+        audio_prompt_path=None,
+        exaggeration=0.0,
+        cfg_weight=0.0,
+        temperature=0.8,
+        top_k=1000,
+        norm_loudness=True,
+        chunk_size=12,
+    ):
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
+            logger.warning("CFG, min_p and exaggeration are not supported by Turbo version and will be ignored.")
+
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = text_tokens.input_ids.to(self.device)
+
+        from .models.s3gen.s3gen_streamer import S3GenStreamer
+        streamer = S3GenStreamer(self.s3gen)
+        
+        token_buffer = []
+        chunk_index = 0
+        start_time = time.time()
+        prefill_end_time = None
+        last_chunk_time = start_time
+
+        for token in self.t3.inference_turbo_stream(
+            t3_cond=self.conds.t3,
+            text_tokens=text_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        ):
+            if prefill_end_time is None:
+                prefill_end_time = time.time()
+
+            # OOV filtering
+            if token < 6561:
+                token_buffer.append(token)
+            
+            if len(token_buffer) >= chunk_size:
+                chunk_tokens = torch.cat(token_buffer, dim=1)
+                audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=False)
+                
+                if audio_chunk is not None:
+                    audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+                    timing = {
+                        'chunk_index': chunk_index,
+                        'chunk_steps': chunk_tokens.shape[1],
+                        'prefill_ms': (prefill_end_time - start_time) * 1000 if chunk_index == 0 else 0,
+                        'decode_ms': (time.time() - last_chunk_time) * 1000
+                    }
+                    yield audio_chunk, self.sr, timing
+                    last_chunk_time = time.time()
+                    chunk_index += 1
+                token_buffer = []
+
+        # Finalize
+        silence = torch.tensor([[S3GEN_SIL, S3GEN_SIL, S3GEN_SIL]]).long().to(self.device)
+        token_buffer.append(silence)
+        
+        chunk_tokens = torch.cat(token_buffer, dim=1)
+        audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=True)
+        if audio_chunk is not None:
+            audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+            timing = {
+                'chunk_index': chunk_index,
+                'chunk_steps': chunk_tokens.shape[1],
+                'prefill_ms': (prefill_end_time - start_time) * 1000 if chunk_index == 0 else 0,
+                'decode_ms': (time.time() - last_chunk_time) * 1000
+            }
+            yield audio_chunk, self.sr, timing

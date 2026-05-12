@@ -169,6 +169,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         h, h_masks = self.encoder(token, token_len)
         if finalize is False:
             h = h[:, :-self.pre_lookahead_len * self.token_mel_ratio]
+            h_masks = h_masks[:, :, :-self.pre_lookahead_len * self.token_mel_ratio]
 
         h_lengths = h_masks.sum(dim=-1).squeeze(dim=-1)
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]

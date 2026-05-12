@@ -50,7 +50,7 @@ class T3Graph:
         dummy_k = torch.zeros(self.batch_size, num_kv_heads, 1, head_dim, dtype=self.dtype, device=self.device)
         for layer in self.static_cache.layers:
             if not layer.is_initialized:
-                layer.lazy_initialization(dummy_k, dummy_k)
+                layer.lazy_initialization(dummy_k)
 
     def _build_attention_masks(self):
         """Pre-compute causal masks for all possible positions."""

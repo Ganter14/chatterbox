@@ -126,6 +126,8 @@ class T3Graph:
                 seq_len = k.shape[2]
                 self.static_cache.layers[li].keys[:, :, :seq_len, :].copy_(k)
                 self.static_cache.layers[li].values[:, :, :seq_len, :].copy_(v)
+            
+            self.static_cache.seen_tokens = seq_len
         else:
             # Llama style: DynamicCache (modern transformers style)
             num_layers = len(past_key_values.layers)

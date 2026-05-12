@@ -24,25 +24,34 @@ def benchmark_model(model_class, text, name, use_cuda_graph=False, **kwargs):
     print("Running benchmark...")
     iterations = 3
     total_time = 0
-    total_tokens = 0
+    total_ttfc = 0
     
     for i in range(iterations):
+        # 1. Full generation
         start = time.time()
-        # We need to capture the number of generated tokens. 
-        # For now, let's just measure the whole generation time.
-        # In a real benchmark we'd hook into the loop.
         wav = model.generate(text, **kwargs)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         end = time.time()
-        
         dur = end - start
         total_time += dur
-        print(f"Iteration {i+1}: {dur:.4f}s")
+        
+        # 2. Streaming TTFC
+        start_st = time.time()
+        for audio_chunk, sr, timing in model.generate_streaming(text, **kwargs):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            ttfc = (time.time() - start_st) * 1000
+            total_ttfc += ttfc
+            break # We only care about the first chunk for TTFC
+            
+        print(f"Iteration {i+1}: full={dur:.4f}s, ttfc={ttfc:.2f}ms")
 
     avg_time = total_time / iterations
+    avg_ttfc = total_ttfc / iterations
     print(f"Average generation time for {name}: {avg_time:.4f}s")
-    return avg_time
+    print(f"Average TTFC for {name}: {avg_ttfc:.2f}ms")
+    return avg_time, avg_ttfc
 
 if __name__ == "__main__":
     if not torch.cuda.is_available():
@@ -78,17 +87,17 @@ if __name__ == "__main__":
         use_cuda_graph=True
     )
 
-    print("\n" + "="*40)
-    print("COMPARISON RESULTS (feat/cuda-graphs branch)")
-    print(f"{'Model':<25} | {'Base':<10} | {'Opt':<10} | {'Speedup':<10}")
-    print("-" * 60)
+    print("\n" + "="*80)
+    print("COMPARISON RESULTS (feat/streaming branch)")
+    print(f"{'Model':<25} | {'Base (s)':<10} | {'Opt (s)':<10} | {'Speedup':<10} | {'TTFC (ms)':<10}")
+    print("-" * 80)
     
     def print_row(base_key, opt_key, label):
-        base = results[base_key]
-        opt = results[opt_key]
-        speedup = base / opt
-        print(f"{label:<25} | {base:<10.4f} | {opt:<10.4f} | {speedup:<10.2f}x")
+        base_time, base_ttfc = results[base_key]
+        opt_time, opt_ttfc = results[opt_key]
+        speedup = base_time / opt_time
+        print(f"{label:<25} | {base_time:<10.4f} | {opt_time:<10.4f} | {speedup:<10.2f}x | {opt_ttfc:<10.2f}")
 
     print_row("Turbo-EN-Base", "Turbo-EN-Optimized", "Turbo-EN")
     print_row("MTL-RU-Base", "MTL-RU-Optimized", "MTL-RU")
-    print("="*40)
+    print("="*80)

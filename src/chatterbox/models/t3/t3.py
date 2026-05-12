@@ -486,3 +486,184 @@ class T3(nn.Module):
             all_tokens = all_tokens[:, :-1]
 
         return all_tokens
+    @torch.inference_mode()
+    def inference_stream(
+        self,
+        *,
+        t3_cond: T3Cond,
+        text_tokens: Tensor,
+        initial_speech_tokens: Optional[Tensor]=None,
+        max_new_tokens=None,
+        stop_on_eos=True,
+        do_sample=True,
+        temperature=0.8,
+        top_p=0.95,
+        min_p=0.05,
+        repetition_penalty=1.2,
+        cfg_weight=0.5,
+    ):
+        """Generator version of inference supporting CFG and CUDA Graphs."""
+        assert initial_speech_tokens is None, "streaming with initial tokens not yet implemented"
+        _ensure_BOT_EOT(text_tokens, self.hp)
+        text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
+
+        embeds, len_cond = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1]),
+            cfg_weight=cfg_weight,
+        )
+
+        if not getattr(self, 'compiled', False):
+            self.patched_model = T3HuggingfaceBackend(
+                config=self.cfg,
+                llama=self.tfmr,
+                speech_enc=self.speech_emb,
+                speech_head=self.speech_head,
+            )
+            self.compiled = True
+
+        bos_token = torch.tensor([[self.hp.start_speech_token]], dtype=torch.long, device=self.device)
+        bos_embed = self.speech_emb(bos_token)
+        if not self.is_gpt:
+            bos_embed = bos_embed + self.speech_pos_emb.get_fixed_embedding(0)
+        
+        bos_embed = torch.cat([bos_embed, bos_embed])
+        inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
+
+        generated_ids = bos_token.clone()
+        
+        top_p_warper = TopPLogitsWarper(top_p=top_p)
+        min_p_warper = MinPLogitsWarper(min_p=min_p)
+        repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
+
+        output = self.patched_model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=None,
+            use_cache=True,
+            return_dict=True,
+        )
+        
+        past = output.past_key_values
+        prefill_len = 0
+        if self.t3_graph is not None and self.t3_graph.captured:
+            prefill_len = self.t3_graph.prefill_kv(past)
+
+        for i in range(max_new_tokens or self.hp.max_speech_tokens):
+            logits_step = output.logits[:, -1, :]
+            cond   = logits_step[0:1, :]
+            uncond = logits_step[1:2, :]
+            cfg = torch.as_tensor(cfg_weight, device=cond.device, dtype=cond.dtype)
+            logits = cond + cfg * (cond - uncond)
+            
+            logits = repetition_penalty_processor(generated_ids[:1, ...], logits)
+            
+            if temperature != 1.0:
+                logits = logits / temperature
+                
+            logits = min_p_warper(generated_ids[:1, ...], logits)
+            logits = top_p_warper(generated_ids[:1, ...], logits)
+
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            yield next_token
+            
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+            if next_token.view(-1) == self.hp.stop_speech_token:
+                break
+
+            next_token_embed = self.speech_emb(next_token)
+            if not self.is_gpt:
+                next_token_embed = next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
+
+            next_token_embed = torch.cat([next_token_embed, next_token_embed])
+
+            if self.t3_graph is not None and self.t3_graph.captured:
+                output_logits = self.t3_graph.run(next_token_embed, position=prefill_len + i)
+                output = AttrDict(logits=output_logits)
+            else:
+                output = self.patched_model(
+                    inputs_embeds=next_token_embed,
+                    past_key_values=past,
+                    return_dict=True,
+                )
+                past = output.past_key_values
+
+    @torch.inference_mode()
+    def inference_turbo_stream(
+        self,
+        t3_cond,
+        text_tokens,
+        temperature=0.8,
+        top_k=1000,
+        top_p=0.95,
+        repetition_penalty=1.2,
+        max_gen_len=1000
+    ):
+        """Generator version of inference_turbo supporting CUDA Graphs."""
+        logits_processors = LogitsProcessorList()
+        if temperature > 0 and temperature != 1.0:
+            logits_processors.append(TemperatureLogitsWarper(temperature))
+        if top_k > 0:
+            logits_processors.append(TopKLogitsWarper(top_k))
+        if top_p < 1.0:
+            logits_processors.append(TopPLogitsWarper(top_p))
+        if repetition_penalty != 1.0:
+            logits_processors.append(RepetitionPenaltyLogitsProcessor(repetition_penalty))
+
+        speech_start_token = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+        embeds, _ = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=speech_start_token,
+            cfg_weight=0.0,
+        )
+
+        llm_outputs = self.tfmr(inputs_embeds=embeds, use_cache=True)
+        past_key_values = llm_outputs.past_key_values
+        
+        prefill_len = 0
+        if self.t3_graph is not None and self.t3_graph.captured:
+            prefill_len = self.t3_graph.prefill_kv(past_key_values)
+
+        speech_logits = self.speech_head(llm_outputs[0][:, -1:])
+        processed_logits = logits_processors(speech_start_token, speech_logits[:, -1, :])
+        probs = F.softmax(processed_logits, dim=-1)
+        next_speech_token = torch.multinomial(probs, num_samples=1)
+
+        yield next_speech_token
+        
+        generated_speech_tokens = [next_speech_token]
+        current_speech_token = next_speech_token
+
+        for i in range(max_gen_len - 1):
+            current_speech_embed = self.speech_emb(current_speech_token)
+
+            if self.t3_graph is not None and self.t3_graph.captured:
+                speech_logits = self.t3_graph.run(current_speech_embed, position=prefill_len + i)
+            else:
+                llm_outputs = self.tfmr(
+                    inputs_embeds=current_speech_embed,
+                    past_key_values=past_key_values,
+                    use_cache=True
+                )
+                past_key_values = llm_outputs.past_key_values
+                speech_logits = self.speech_head(llm_outputs[0])
+
+            input_ids = torch.cat(generated_speech_tokens, dim=1)
+            processed_logits = logits_processors(input_ids, speech_logits[:, -1, :])
+            
+            if torch.all(processed_logits == -float("inf")):
+                break
+
+            probs = F.softmax(processed_logits, dim=-1)
+            next_speech_token = torch.multinomial(probs, num_samples=1)
+
+            yield next_speech_token
+            
+            generated_speech_tokens.append(next_speech_token)
+            current_speech_token = next_speech_token
+            if torch.all(next_speech_token == self.hp.stop_speech_token):
+                break

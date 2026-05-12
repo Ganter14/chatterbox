@@ -270,3 +270,97 @@ class ChatterboxTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+    def generate_streaming(
+        self,
+        text,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        chunk_size=12,
+    ):
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        # Update exaggeration if needed
+        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+
+        if cfg_weight > 0.0:
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        from .models.s3gen.s3gen_streamer import S3GenStreamer
+        streamer = S3GenStreamer(self.s3gen)
+        
+        token_buffer = []
+        chunk_index = 0
+        import time
+        start_time = time.time()
+        prefill_end_time = None
+        last_chunk_time = start_time
+
+        with torch.inference_mode():
+            for token in self.t3.inference_stream(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                max_new_tokens=1000,
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            ):
+                if prefill_end_time is None:
+                    prefill_end_time = time.time()
+
+                # OOV filtering
+                if token < 6561:
+                    token_buffer.append(token)
+                
+                if len(token_buffer) >= chunk_size:
+                    chunk_tokens = torch.cat(token_buffer, dim=1)
+                    audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=False)
+                    
+                    if audio_chunk is not None:
+                        timing = {
+                            'chunk_index': chunk_index,
+                            'chunk_steps': chunk_tokens.shape[1],
+                            'prefill_ms': (prefill_end_time - start_time) * 1000 if chunk_index == 0 else 0,
+                            'decode_ms': (time.time() - last_chunk_time) * 1000
+                        }
+                        yield audio_chunk, self.sr, timing
+                        last_chunk_time = time.time()
+                        chunk_index += 1
+                    token_buffer = []
+
+            # Finalize
+            if token_buffer:
+                chunk_tokens = torch.cat(token_buffer, dim=1)
+                audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=True)
+                if audio_chunk is not None:
+                    timing = {
+                        'chunk_index': chunk_index,
+                        'chunk_steps': chunk_tokens.shape[1],
+                        'prefill_ms': (prefill_end_time - start_time) * 1000 if chunk_index == 0 else 0,
+                        'decode_ms': (time.time() - last_chunk_time) * 1000
+                    }
+                    yield audio_chunk, self.sr, timing

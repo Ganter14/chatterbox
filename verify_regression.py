@@ -69,6 +69,26 @@ def verify():
     
     test_results.append(compare_wavs(wav_mtl_base, wav_mtl_opt, "MTL-RU"))
 
+    # 3. Streaming vs Non-streaming
+    print("\n[Testing Streaming vs Non-streaming (Turbo)]")
+    text_st = "Streaming should be consistent with full generation."
+    set_seed(seed)
+    # Use the same model instance to avoid reloading
+    wav_full = model_turbo_opt.generate(text_st, temperature=0.001)
+    
+    set_seed(seed)
+    chunks = []
+    for chunk, sr, timing in model_turbo_opt.generate_streaming(text_st, temperature=0.001):
+        chunks.append(chunk)
+    wav_stream = torch.from_numpy(np.concatenate(chunks)).unsqueeze(0)
+    
+    # Note: streaming might be slightly different due to watermarking (which is only in generate)
+    # and potential minor boundary differences. 
+    # But with temperature=0.001 (greedy), the tokens should be identical.
+    # The audio might differ if we don't handle watermarking in streamer.
+    # For now, let's just see how close they are.
+    test_results.append(compare_wavs(wav_full, wav_stream, "Streaming-Consistency"))
+
     print("\n" + "="*40)
     if all(test_results):
         print("FINAL VERDICT: ALL REGRESSION TESTS PASSED")

@@ -17,7 +17,8 @@ def benchmark_model(model_class, text, name, use_cuda_graph=False, **kwargs):
     # Warmup
     print("Warmup...")
     model.generate(text, **kwargs)
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
     # Benchmark
     print("Running benchmark...")
@@ -31,7 +32,8 @@ def benchmark_model(model_class, text, name, use_cuda_graph=False, **kwargs):
         # For now, let's just measure the whole generation time.
         # In a real benchmark we'd hook into the loop.
         wav = model.generate(text, **kwargs)
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         end = time.time()
         
         dur = end - start

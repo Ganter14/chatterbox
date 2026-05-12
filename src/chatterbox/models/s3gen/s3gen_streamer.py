@@ -8,9 +8,8 @@ class S3GenStreamer:
     Stateful streamer for S3Gen (Flow + Vocoder).
     Uses a sliding window/accumulated decode approach to ensure continuity.
     """
-    def __init__(self, s3gen, context_tokens=25):
+    def __init__(self, s3gen):
         self.s3gen = s3gen
-        self.context_tokens = context_tokens
         self.all_tokens = []
         self.prev_audio_len = 0
         self.pre_lookahead = getattr(s3gen.flow, 'pre_lookahead_len', 3)
@@ -25,9 +24,12 @@ class S3GenStreamer:
             ref_dict (dict): Conditionals for S3Gen
             finalize (bool): If True, processes all remaining tokens
             
-        Yields:
+        Returns:
             np.ndarray: New audio samples
         """
+        if not isinstance(new_tokens, torch.Tensor):
+            raise TypeError(f"Expected new_tokens to be torch.Tensor, got {type(new_tokens)}")
+
         if new_tokens.ndim == 1:
             new_tokens = new_tokens.unsqueeze(0)
         

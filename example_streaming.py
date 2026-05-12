@@ -54,7 +54,7 @@ def main():
     first_chunk = True
     
     try:
-        for audio_chunk, sr, timing in model.generate_streaming(args.text, chunk_size=args.chunk_size):
+        for audio_chunk, _sr, timing in model.generate_streaming(args.text, chunk_size=args.chunk_size):
             if first_chunk:
                 ttfc = (time.time() - start_gen) * 1000
                 print(f"TTFC (Time To First Chunk): {ttfc:.2f}ms")

@@ -119,6 +119,7 @@ class ChatterboxTurboTTS:
         tokenizer: EnTokenizer,
         device: str,
         conds: Conditionals = None,
+        use_cuda_graph: bool = False,
     ):
         self.sr = S3GEN_SR  # sample rate of synthesized audio
         self.t3 = t3
@@ -128,9 +129,14 @@ class ChatterboxTurboTTS:
         self.device = device
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
+        
+        if use_cuda_graph and device == "cuda":
+            from .models.t3.t3_graph import T3Graph
+            self.t3.t3_graph = T3Graph(self.t3, batch_size=1, device=device)
+            self.t3.t3_graph.capture()
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> 'ChatterboxTurboTTS':
+    def from_local(cls, ckpt_dir, device, use_cuda_graph=False) -> 'ChatterboxTurboTTS':
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
@@ -180,10 +186,10 @@ class ChatterboxTurboTTS:
         if builtin_voice.exists():
             conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
-        return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
+        return cls(t3, s3gen, ve, tokenizer, device, conds=conds, use_cuda_graph=use_cuda_graph)
 
     @classmethod
-    def from_pretrained(cls, device) -> 'ChatterboxTurboTTS':
+    def from_pretrained(cls, device, use_cuda_graph=False) -> 'ChatterboxTurboTTS':
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
@@ -199,7 +205,7 @@ class ChatterboxTurboTTS:
             allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"]
         )
 
-        return cls.from_local(local_path, device)
+        return cls.from_local(local_path, device, use_cuda_graph=use_cuda_graph)
 
     def norm_loudness(self, wav, sr, target_lufs=-27):
         try:

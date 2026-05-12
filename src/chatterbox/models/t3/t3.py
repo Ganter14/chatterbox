@@ -84,6 +84,7 @@ class T3(nn.Module):
         self.text_head = nn.Linear(self.cfg.hidden_size, hp.text_tokens_dict_size, bias=False)
         self.speech_head = nn.Linear(self.cfg.hidden_size, hp.speech_tokens_dict_size, bias=self.is_gpt)
         self.compiled = False
+        self.t3_graph = None
 
     @property
     def device(self):
@@ -137,6 +138,8 @@ class T3(nn.Module):
         text_token_lens: torch.LongTensor,
         speech_tokens: torch.LongTensor,
         speech_token_lens: torch.LongTensor,
+        past_key_values=None,
+        cache_position=None,
         training=False,
     ):
         _ensure_BOT_EOT(text_tokens, self.hp)
@@ -153,9 +156,11 @@ class T3(nn.Module):
             input_ids=None,
             # position_ids=position_ids, # TODO? ROPE should be fine?
             inputs_embeds=embeds,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
             output_hidden_states=True,
             return_dict=True,
-            use_cache=(not training),
+            use_cache=(not training) or (past_key_values is not None),
         )
         hidden_states = tfmr_out.hidden_states[-1]  # final tfmr layer output, (B, seq, dim)
 
@@ -333,6 +338,9 @@ class T3(nn.Module):
         )
         # Initialize kv_cache with the full context.
         past = output.past_key_values
+        prefill_len = 0
+        if self.t3_graph is not None and self.t3_graph.captured:
+            prefill_len = self.t3_graph.prefill_kv(past)
 
         # ---- Generation Loop using kv_cache ----
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
@@ -375,15 +383,20 @@ class T3(nn.Module):
             next_token_embed = torch.cat([next_token_embed, next_token_embed])
 
             # Forward pass with only the new token and the cached past.
-            output = self.patched_model(
-                inputs_embeds=next_token_embed,
-                past_key_values=past,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            # Update the kv_cache.
-            past = output.past_key_values
+            if self.t3_graph is not None and self.t3_graph.captured:
+                output_logits = self.t3_graph.run(next_token_embed, position=prefill_len + len(predicted))
+                # For compatibility with the rest of the loop, we need an object with .logits
+                output = AttrDict(logits=output_logits)
+            else:
+                output = self.patched_model(
+                    inputs_embeds=next_token_embed,
+                    past_key_values=past,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                # Update the kv_cache.
+                past = output.past_key_values
 
         # Concatenate all predicted tokens along the sequence dimension.
         predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
@@ -421,6 +434,9 @@ class T3(nn.Module):
 
         hidden_states = llm_outputs[0]
         past_key_values = llm_outputs.past_key_values
+        prefill_len = 0
+        if self.t3_graph is not None and self.t3_graph.captured:
+            prefill_len = self.t3_graph.prefill_kv(past_key_values)
 
         speech_hidden = hidden_states[:, -1:]
         speech_logits = self.speech_head(speech_hidden)
@@ -435,15 +451,19 @@ class T3(nn.Module):
         for _ in tqdm(range(max_gen_len)):
             current_speech_embed = self.speech_emb(current_speech_token)
 
-            llm_outputs = self.tfmr(
-                inputs_embeds=current_speech_embed,
-                past_key_values=past_key_values,
-                use_cache=True
-            )
-
-            hidden_states = llm_outputs[0]
-            past_key_values = llm_outputs.past_key_values
-            speech_logits = self.speech_head(hidden_states)
+            if self.t3_graph is not None and self.t3_graph.captured:
+                # Use CUDA Graph for the single-token decode step
+                # Note: T3Graph.run handles cache_position and active_mask internally
+                speech_logits = self.t3_graph.run(current_speech_embed, position=prefill_len + len(generated_speech_tokens) - 1)
+            else:
+                llm_outputs = self.tfmr(
+                    inputs_embeds=current_speech_embed,
+                    past_key_values=past_key_values,
+                    use_cache=True
+                )
+                hidden_states = llm_outputs[0]
+                past_key_values = llm_outputs.past_key_values
+                speech_logits = self.speech_head(hidden_states)
 
             input_ids = torch.cat(generated_speech_tokens, dim=1)
             processed_logits = logits_processors(input_ids, speech_logits[:, -1, :])

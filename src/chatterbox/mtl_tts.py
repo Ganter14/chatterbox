@@ -164,6 +164,7 @@ class ChatterboxMultilingualTTS:
         tokenizer: MTLTokenizer,
         device: str,
         conds: Conditionals = None,
+        use_cuda_graph: bool = False,
     ):
         self.sr = S3GEN_SR  # sample rate of synthesized audio
         self.t3 = t3
@@ -173,6 +174,11 @@ class ChatterboxMultilingualTTS:
         self.device = device
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
+
+        if use_cuda_graph and device == "cuda":
+            from .models.t3.t3_graph import T3Graph
+            self.t3.t3_graph = T3Graph(self.t3, batch_size=2, device=device)
+            self.t3.t3_graph.capture()
 
     @classmethod
     def get_supported_languages(cls):
@@ -185,6 +191,7 @@ class ChatterboxMultilingualTTS:
         ckpt_dir,
         device,
         t3_model: str | None = None,
+        use_cuda_graph: bool = False,
     ) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(ckpt_dir)
         t3_model = _resolve_multilingual_t3_model(t3_model)
@@ -222,13 +229,14 @@ class ChatterboxMultilingualTTS:
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
             conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
-        return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
+        return cls(t3, s3gen, ve, tokenizer, device, conds=conds, use_cuda_graph=use_cuda_graph)
 
     @classmethod
     def from_pretrained(
         cls,
         device: torch.device,
         t3_model: str | None = None,
+        use_cuda_graph: bool = False,
     ) -> 'ChatterboxMultilingualTTS':
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
@@ -248,7 +256,7 @@ class ChatterboxMultilingualTTS:
                 token=os.getenv("HF_TOKEN"),
             )
         )
-        return cls.from_local(ckpt_dir, device, t3_model=t3_model)
+        return cls.from_local(ckpt_dir, device, t3_model=t3_model, use_cuda_graph=use_cuda_graph)
     
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav

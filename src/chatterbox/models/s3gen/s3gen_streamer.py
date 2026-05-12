@@ -13,8 +13,7 @@ class S3GenStreamer:
         self.context_tokens = context_tokens
         self.all_tokens = []
         self.prev_audio_len = 0
-        self.samples_per_token = S3GEN_SR // S3_TOKEN_RATE
-        self.pre_lookahead = 3 # from flow.py
+        self.pre_lookahead = getattr(s3gen.flow, 'pre_lookahead_len', 3)
 
     @torch.inference_mode()
     def stream(self, new_tokens, ref_dict, finalize=False):

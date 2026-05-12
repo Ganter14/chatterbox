@@ -9,6 +9,7 @@ import perth
 import pyloudnorm as ln
 
 from safetensors.torch import load_file
+import time
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
@@ -332,7 +333,6 @@ class ChatterboxTurboTTS:
         
         token_buffer = []
         chunk_index = 0
-        import time
         start_time = time.time()
         prefill_end_time = None
         last_chunk_time = start_time
@@ -357,6 +357,7 @@ class ChatterboxTurboTTS:
                 audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=False)
                 
                 if audio_chunk is not None:
+                    audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
                     timing = {
                         'chunk_index': chunk_index,
                         'chunk_steps': chunk_tokens.shape[1],
@@ -375,6 +376,7 @@ class ChatterboxTurboTTS:
         chunk_tokens = torch.cat(token_buffer, dim=1)
         audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=True)
         if audio_chunk is not None:
+            audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
             timing = {
                 'chunk_index': chunk_index,
                 'chunk_steps': chunk_tokens.shape[1],

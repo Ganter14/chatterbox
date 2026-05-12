@@ -8,6 +8,7 @@ import perth
 import torch.nn.functional as F
 from safetensors.torch import load_file as load_safetensors
 from huggingface_hub import snapshot_download
+import time
 
 from .models.t3 import T3
 from .models.t3.modules.t3_config import T3Config
@@ -411,7 +412,6 @@ class ChatterboxMultilingualTTS:
         
         token_buffer = []
         chunk_index = 0
-        import time
         start_time = time.time()
         prefill_end_time = None
         last_chunk_time = start_time
@@ -439,6 +439,7 @@ class ChatterboxMultilingualTTS:
                     audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=False)
                     
                     if audio_chunk is not None:
+                        audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
                         # Note: we drop the final token's audio in generate, 
                         # but in streaming we handle it via finalize=True in the streamer.
                         timing = {
@@ -457,6 +458,7 @@ class ChatterboxMultilingualTTS:
                 chunk_tokens = torch.cat(token_buffer, dim=1)
                 audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=True)
                 if audio_chunk is not None:
+                    audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
                     # Apply the same 1-token trim logic as in generate()?
                     # S3GenStreamer already handles lookahead. 
                     # If finalize=True, it will include everything up to the end.

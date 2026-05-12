@@ -7,6 +7,7 @@ import perth
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
+import time
 
 from .models.t3 import T3
 from .models.s3tokenizer import S3_SR, drop_invalid_tokens
@@ -313,7 +314,6 @@ class ChatterboxTTS:
         
         token_buffer = []
         chunk_index = 0
-        import time
         start_time = time.time()
         prefill_end_time = None
         last_chunk_time = start_time
@@ -341,6 +341,7 @@ class ChatterboxTTS:
                     audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=False)
                     
                     if audio_chunk is not None:
+                        audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
                         timing = {
                             'chunk_index': chunk_index,
                             'chunk_steps': chunk_tokens.shape[1],
@@ -357,6 +358,7 @@ class ChatterboxTTS:
                 chunk_tokens = torch.cat(token_buffer, dim=1)
                 audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=True)
                 if audio_chunk is not None:
+                    audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
                     timing = {
                         'chunk_index': chunk_index,
                         'chunk_steps': chunk_tokens.shape[1],

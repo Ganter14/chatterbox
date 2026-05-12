@@ -24,8 +24,8 @@ def main():
     print(f"Loading model on {args.device} (CUDA Graphs: {args.use_cuda_graph})...")
     model = ChatterboxTurboTTS.from_pretrained(device=args.device, use_cuda_graph=args.use_cuda_graph)
 
-    # Audio playback queue
-    audio_q = queue.Queue()
+    # Audio playback queue (bounded to 100 blocks for backpressure)
+    audio_q = queue.Queue(maxsize=100)
 
     def callback(outdata, frames, time_info, status):
         if status:

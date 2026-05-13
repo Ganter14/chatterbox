@@ -336,6 +336,7 @@ class ChatterboxTurboTTS:
         start_time = time.time()
         prefill_end_time = None
         last_chunk_time = start_time
+        pending = None  # (audio_chunk, timing_without_is_final)
 
         for token in self.t3.inference_turbo_stream(
             t3_cond=self.conds.t3,
@@ -364,8 +365,11 @@ class ChatterboxTurboTTS:
                         'prefill_ms': (prefill_end_time - start_time) * 1000 if chunk_index == 0 else 0,
                         'decode_ms': (time.time() - last_chunk_time) * 1000
                     }
-                    yield audio_chunk, self.sr, timing
-                    last_chunk_time = time.time()
+                    if pending is not None:
+                        p_audio, p_timing = pending
+                        yield p_audio, self.sr, {**p_timing, 'is_final': False}
+                        last_chunk_time = time.time()
+                    pending = (audio_chunk, timing)
                     chunk_index += 1
                 token_buffer = []
 
@@ -383,4 +387,12 @@ class ChatterboxTurboTTS:
                 'prefill_ms': (prefill_end_time - start_time) * 1000 if chunk_index == 0 else 0,
                 'decode_ms': (time.time() - last_chunk_time) * 1000
             }
-            yield audio_chunk, self.sr, timing
+            if pending is not None:
+                p_audio, p_timing = pending
+                yield p_audio, self.sr, {**p_timing, 'is_final': False}
+                last_chunk_time = time.time()
+            pending = (audio_chunk, timing)
+
+        if pending is not None:
+            p_audio, p_timing = pending
+            yield p_audio, self.sr, {**p_timing, 'is_final': True}

@@ -102,7 +102,7 @@ flowchart LR
 
 Запуск из каталога `chatterbox/` (предпочтительно через `uv run python …`).
 
-1. **`verify_regression.py`**: Сравнивает baseline и `use_cuda_graph=True`. Успех: **`mse < 1e-3`**.
+1. **`verify_regression.py`**: Сравнивает baseline и `use_cuda_graph=True`. Успех: **`mse < 1e-3`**. По умолчанию фазы (Turbo-EN, MTL-RU, стриминг) выполняются в **отдельных подпроцессах**, чтобы драйвер полностью освобождал VRAM между фазами; отладка в одном процессе: `CHATTERBOX_REGRESSION_INPROC=1 uv run python verify_regression.py`. Одна фаза вручную: `uv run python verify_regression.py turbo_en` (или `mtl_ru`, `streaming`).
 2. **`benchmark_cuda.py`**: Замер времени `generate` и TTFC. Не допускать относительной просадки FPS.
 3. **`verify_update.py`**: Сквозная проверка (TTS + Whisper). Семантическое соответствие текста.
 

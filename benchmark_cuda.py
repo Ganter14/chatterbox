@@ -1,8 +1,18 @@
+import gc
 import time
+
 import torch
-import torchaudio as ta
-from chatterbox.tts_turbo import ChatterboxTurboTTS
+
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+
+def _free_cuda() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
 
 def benchmark_model(model_class, text, name, use_cuda_graph=False, **kwargs):
     print(f"\nBenchmarking {name}...")
@@ -51,6 +61,8 @@ def benchmark_model(model_class, text, name, use_cuda_graph=False, **kwargs):
     avg_ttfc = total_ttfc / iterations
     print(f"Average generation time for {name}: {avg_time:.4f}s")
     print(f"Average TTFC for {name}: {avg_ttfc:.2f}ms")
+    del model
+    _free_cuda()
     return avg_time, avg_ttfc
 
 if __name__ == "__main__":

@@ -420,9 +420,13 @@ class ChatterboxMultilingualTTS:
         start_time = time.time()
         prefill_end_time = None
         last_chunk_time = start_time
-        pending = None  # (audio_chunk, timing_without_is_final)
+        pending = None
+        stop_token = self.t3.hp.stop_speech_token
 
         with torch.inference_mode():
+            sos_token = self.t3.hp.start_speech_token
+            eos_token = self.t3.hp.stop_speech_token
+            started = True
             for token in self.t3.inference_stream(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
@@ -436,8 +440,15 @@ class ChatterboxMultilingualTTS:
                 if prefill_end_time is None:
                     prefill_end_time = time.time()
 
-                # OOV filtering
-                if token < 6561:
+                t_val = token.item()
+                print(f"DEBUG TOKEN: {t_val}")
+                if t_val == sos_token:
+                    started = True
+                    continue
+                if t_val == eos_token:
+                    break
+
+                if started and t_val < 6561:
                     token_buffer.append(token)
                 
                 if len(token_buffer) >= chunk_size:
@@ -445,6 +456,12 @@ class ChatterboxMultilingualTTS:
                     audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=False)
                     
                     if audio_chunk is not None:
+                        # Match full generate() behavior: apply trim_fade to the first chunk
+                        if chunk_index == 0 and hasattr(self.s3gen, 'trim_fade'):
+                            fade = self.s3gen.trim_fade.cpu().numpy()
+                            n = min(audio_chunk.shape[0], fade.shape[0])
+                            audio_chunk[:n] *= fade[:n]
+
                         if not skip_watermark:
                             audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
                         
@@ -467,6 +484,16 @@ class ChatterboxMultilingualTTS:
                 chunk_tokens = torch.cat(token_buffer, dim=1)
                 audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=True)
                 if audio_chunk is not None:
+                    # Match full generate() behavior: drop the last token's audio
+                    if audio_chunk.shape[0] >= streamer.samples_per_token:
+                        audio_chunk = audio_chunk[:-streamer.samples_per_token]
+
+                    # Match full generate() behavior: apply trim_fade to the first chunk
+                    if chunk_index == 0 and hasattr(self.s3gen, 'trim_fade'):
+                        fade = self.s3gen.trim_fade.cpu().numpy()
+                        n = min(audio_chunk.shape[0], fade.shape[0])
+                        audio_chunk[:n] *= fade[:n]
+
                     if not skip_watermark:
                         audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
                     

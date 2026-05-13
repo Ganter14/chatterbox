@@ -2,18 +2,22 @@ import torch
 import numpy as np
 from .s3gen import S3GEN_SR
 from ..s3tokenizer import S3_TOKEN_RATE
+from .utils.mask import make_pad_mask
 
 class S3GenStreamer:
     """
     Stateful streamer for S3Gen (Flow + Vocoder).
     Uses accumulated tokens with prompt caching to ensure efficiency.
+    Implemented with sliding window for O(N) complexity.
     """
-    def __init__(self, s3gen, n_cfm_timesteps=None):
+    def __init__(self, s3gen, n_cfm_timesteps=None, window_size=120):
         self.s3gen = s3gen
         self.all_tokens = []
         self.prev_audio_len = 0
         self.pre_lookahead = getattr(s3gen.flow, 'pre_lookahead_len', 3)
         self.n_cfm_timesteps = n_cfm_timesteps
+        self.window_size = window_size # tokens
+        self.samples_per_token = S3GEN_SR // S3_TOKEN_RATE
         
         # Optimization: Pre-encoded prompt
         self.prompt_enc = None
@@ -21,31 +25,6 @@ class S3GenStreamer:
         
         # Vocoder state for continuity
         self.last_s = None
-
-    @torch.inference_mode()
-    def _get_prompt_enc(self, ref_dict):
-        """Pre-encode prompt tokens to avoid redundant computation."""
-        if self.prompt_enc is not None:
-            return self.prompt_enc, self.prompt_mask
-        
-        prompt_token = ref_dict['prompt_token']
-        prompt_token_len = ref_dict['prompt_token_len']
-        
-        # We need to access the flow's encoder and input_embedding
-        flow = self.s3gen.flow
-        B = prompt_token.size(0)
-        
-        # batching logic same as in flow.inference
-        from .flow import _repeat_batch_dim
-        prompt_token = _repeat_batch_dim(prompt_token, B, ndim=2)
-        prompt_token_len = _repeat_batch_dim(prompt_token_len, B, ndim=1)
-        
-        from .utils.mask import make_pad_mask
-        mask = (~make_pad_mask(prompt_token_len)).unsqueeze(-1).to(flow.spk_embed_affine_layer.weight.device)
-        token_emb = flow.input_embedding(prompt_token.long()) * mask
-        
-        self.prompt_enc, self.prompt_mask = flow.encoder(token_emb, prompt_token_len)
-        return self.prompt_enc, self.prompt_mask
 
     @torch.inference_mode()
     def stream(self, new_tokens, ref_dict, finalize=False):
@@ -58,29 +37,54 @@ class S3GenStreamer:
         if new_tokens.ndim == 1:
             new_tokens = new_tokens.unsqueeze(0)
         
-        self.all_tokens.append(new_tokens)
-        all_flat = torch.cat(self.all_tokens, dim=1)
+        # Pre-encode prompt if not already done
+        if self.prompt_enc is None:
+            prompt_token = ref_dict['prompt_token']
+            prompt_token_len = ref_dict['prompt_token_len']
+            
+            # Embed and encode prompt
+            # We must use the same logic as in flow.py
+            mask = (~make_pad_mask(prompt_token_len, prompt_token.size(1))).unsqueeze(-1).to(prompt_token.device)
+            token_emb = self.s3gen.flow.input_embedding(prompt_token.long()) * mask.to(self.s3gen.flow.input_embedding.weight.dtype)
+            self.prompt_enc, self.prompt_mask = self.s3gen.flow.encoder(token_emb, prompt_token_len)
         
-        if not finalize and all_flat.shape[1] <= self.pre_lookahead:
+        # Accumulate speech tokens for the decoder context (history)
+        self.all_tokens.append(new_tokens)
+        all_speech_tokens = torch.cat(self.all_tokens, dim=1)
+        
+        # Sliding window optimization
+        if not finalize and all_speech_tokens.shape[1] > self.window_size + self.pre_lookahead:
+            overflow = all_speech_tokens.shape[1] - (self.window_size + self.pre_lookahead)
+            all_speech_tokens = all_speech_tokens[:, overflow:]
+            self.all_tokens = [all_speech_tokens]
+            
+            if self.last_s is not None:
+                overflow_samples = overflow * self.samples_per_token
+                if self.last_s.shape[2] > overflow_samples:
+                    self.last_s = self.last_s[:, :, overflow_samples:]
+                else:
+                    self.last_s = None
+            self.prev_audio_len = max(0, self.prev_audio_len - overflow * self.samples_per_token)
+
+        if not finalize and all_speech_tokens.shape[1] <= self.pre_lookahead:
             return None
 
-        # Pre-encode prompt if not already done
-        p_enc, p_mask = self._get_prompt_enc(ref_dict)
-        
-        # Call flow inference with pre-encoded prompt
+        # Call flow inference WITH prompt_enc
+        # We pass ONLY the accumulated speech tokens (not the prompt)
         output_mels = self.s3gen.flow_inference(
-            all_flat,
+            all_speech_tokens,
             ref_dict=ref_dict,
             finalize=finalize,
-            prompt_enc=p_enc,
-            prompt_mask=p_mask,
-            n_cfm_timesteps=self.n_cfm_timesteps
+            n_cfm_timesteps=self.n_cfm_timesteps,
+            prompt_enc=self.prompt_enc,
+            prompt_mask=self.prompt_mask
         )
-        if torch.cuda.is_available(): torch.cuda.synchronize()
+        
+        # Ensure correct dtype (important for fp16 mode)
+        output_mels = output_mels.to(dtype=self.s3gen.dtype)
         
         # Vocoder inference with caching for continuity
         output_wavs, self.last_s = self.s3gen.hift_inference(output_mels, cache_source=self.last_s)
-        if torch.cuda.is_available(): torch.cuda.synchronize()
         
         # Convert to numpy and trim what we already yielded
         wav = output_wavs.squeeze(0).detach().cpu().numpy()

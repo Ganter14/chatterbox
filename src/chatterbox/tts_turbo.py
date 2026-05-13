@@ -264,6 +264,7 @@ class ChatterboxTurboTTS:
         temperature=0.8,
         top_k=1000,
         norm_loudness=True,
+        skip_watermark=False,
     ):
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
@@ -299,8 +300,10 @@ class ChatterboxTurboTTS:
             n_cfm_timesteps=2,
         )
         wav = wav.squeeze(0).detach().cpu().numpy()
-        watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        if not skip_watermark:
+            wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+        return torch.from_numpy(wav).unsqueeze(0)
+
     def generate_streaming(
         self,
         text,
@@ -314,6 +317,7 @@ class ChatterboxTurboTTS:
         top_k=1000,
         norm_loudness=True,
         chunk_size=12,
+        skip_watermark=False,
     ):
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
@@ -358,7 +362,9 @@ class ChatterboxTurboTTS:
                 audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=False)
                 
                 if audio_chunk is not None:
-                    audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+                    if not skip_watermark:
+                        audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+                    
                     timing = {
                         'chunk_index': chunk_index,
                         'chunk_steps': chunk_tokens.shape[1],
@@ -380,7 +386,9 @@ class ChatterboxTurboTTS:
         chunk_tokens = torch.cat(token_buffer, dim=1)
         audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=True)
         if audio_chunk is not None:
-            audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+            if not skip_watermark:
+                audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+            
             timing = {
                 'chunk_index': chunk_index,
                 'chunk_steps': chunk_tokens.shape[1],
@@ -396,3 +404,4 @@ class ChatterboxTurboTTS:
         if pending is not None:
             p_audio, p_timing = pending
             yield p_audio, self.sr, {**p_timing, 'is_final': True}
+

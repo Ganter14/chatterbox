@@ -182,6 +182,8 @@ class S3Token2Mel(torch.nn.Module):
         finalize: bool = False,
         speech_token_lens=None,
         noised_mels=None,
+        prompt_enc=None,
+        prompt_mask=None,
     ):
         """
         Generate waveforms from S3 speech tokens and a reference waveform, which the speaker timbre is inferred from.
@@ -224,6 +226,8 @@ class S3Token2Mel(torch.nn.Module):
             noised_mels=noised_mels,
             n_timesteps=n_cfm_timesteps,
             meanflow=self.meanflow,
+            prompt_enc=prompt_enc,
+            prompt_mask=prompt_mask,
             **ref_dict,
         )
         return output_mels
@@ -271,7 +275,8 @@ class S3Token2Wav(S3Token2Mel):
         skip_vocoder=False,
         n_cfm_timesteps=None,
         noised_mels=None,
-
+        prompt_enc=None,
+        prompt_mask=None,
     ):
         """
         Generate waveforms from S3 speech tokens and a reference waveform, which the speaker timbre is inferred from.
@@ -281,7 +286,9 @@ class S3Token2Wav(S3Token2Mel):
             speech_tokens, speech_token_lens=speech_token_lens, ref_wav=ref_wav,
             ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize,
             n_cfm_timesteps=n_cfm_timesteps, noised_mels=noised_mels,
+            prompt_enc=prompt_enc, prompt_mask=prompt_mask,
         )
+
 
         if skip_vocoder:
             return output_mels
@@ -309,16 +316,21 @@ class S3Token2Wav(S3Token2Mel):
         n_cfm_timesteps = None,
         finalize: bool = False,
         speech_token_lens=None,
+        prompt_enc=None,
+        prompt_mask=None,
     ):
         n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
         noise = None
         if self.meanflow:
             noise = torch.randn(1, 80, speech_tokens.size(-1) * 2, dtype=self.dtype, device=self.device)
-        output_mels = super().forward(
-            speech_tokens, speech_token_lens=speech_token_lens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict,
+        output_mels = S3Token2Mel.forward(
+            self, speech_tokens, speech_token_lens=speech_token_lens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict,
             n_cfm_timesteps=n_cfm_timesteps, finalize=finalize, noised_mels=noise,
+            prompt_enc=prompt_enc, prompt_mask=prompt_mask,
         )
         return output_mels
+
+
 
     @torch.inference_mode()
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):

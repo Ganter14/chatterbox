@@ -69,6 +69,7 @@ flowchart LR
 
 - [`agent-docs/cuda-graphs-optimization-walkthrough.md`](agent-docs/cuda-graphs-optimization-walkthrough.md) — `StaticCache`, жизненный цикл `T3Graph` (prefill → копирование KV → decode через graph), маскирование, **эталонные таблицы** времени полной генерации (Turbo EN и MTL RU, baseline vs оптимизированная версия).
 - [`agent-docs/streaming-walkthrough.md`](agent-docs/streaming-walkthrough.md) — методы `generate_streaming`, TTFC, связка T3-streaming + `S3GenStreamer`, проверки согласованности с полной генерацией.
+- [`agent-docs/streaming-performance-optimization.md`](agent-docs/streaming-performance-optimization.md) — кеширование промпта (prompt caching), состояние вокодера (stateful vocoder) и отключение водяных знаков для достижения RTF < 1.0.
 
 Перед изменениями в `t3_graph.py`, цикле decode или кэше — cuda-graphs walkthrough. Перед изменениями в `generate_streaming`, `S3GenStreamer` или chunked API — streaming walkthrough.
 

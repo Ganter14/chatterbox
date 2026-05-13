@@ -140,7 +140,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                   finalize,
                   n_timesteps=10,
                   noised_mels=None,
-                  meanflow=False):
+                  meanflow=False,
+                  prompt_enc=None,
+                  prompt_mask=None):
         # token: (B, n_toks)
         # token_len: (B,)
         B = token.size(0)
@@ -157,16 +159,28 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         prompt_feat_len = _repeat_batch_dim(prompt_feat_len, B, ndim=1)  # (B,) or None
         embedding = _repeat_batch_dim(embedding, B, ndim=2)  # (B, emb_dim)
 
-        # concat text and prompt_text
-        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        if prompt_enc is not None:
+            # OPTIMIZATION: Use pre-encoded prompt
+            # Encode only new tokens
+            mask_new = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+            token_emb_new = self.input_embedding(token.long()) * mask_new
+            h_new, h_masks_new = self.encoder(token_emb_new, token_len)
+            
+            h = torch.cat([prompt_enc, h_new], dim=1)
+            h_masks = torch.cat([prompt_mask, h_masks_new], dim=2)
+            token_len = prompt_token_len + token_len
+        else:
+            # concat text and prompt_text
+            token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+            mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
 
-        if (token >= self.vocab_size).any():
-            logger.error(f"{token.max()}>{self.vocab_size}\n out-of-range special tokens found in flow, fix inputs!")
-        token = self.input_embedding(token.long()) * mask
+            if (token >= self.vocab_size).any():
+                logger.error(f"{token.max()}>{self.vocab_size}\n out-of-range special tokens found in flow, fix inputs!")
+            token = self.input_embedding(token.long()) * mask
 
-        # text encode
-        h, h_masks = self.encoder(token, token_len)
+            # text encode
+            h, h_masks = self.encoder(token, token_len)
+        
         if finalize is False:
             h = h[:, :-self.pre_lookahead_len * self.token_mel_ratio]
             h_masks = h_masks[:, :, :-self.pre_lookahead_len * self.token_mel_ratio]
@@ -196,4 +210,5 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
-        return feat, None  # NOTE jrm: why are they returning None here?
+        return feat, None
+

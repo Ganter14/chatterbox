@@ -297,6 +297,7 @@ class ChatterboxMultilingualTTS:
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        skip_watermark=False,
     ):
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
@@ -360,8 +361,10 @@ class ChatterboxMultilingualTTS:
             st_len = max(1, n_tokens - 1)
             wav = wav[: st_len * (S3GEN_SR // S3_TOKEN_RATE)]
 
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+            if not skip_watermark:
+                wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+        return torch.from_numpy(wav).unsqueeze(0)
+
     def generate_streaming(
         self,
         text,
@@ -374,6 +377,8 @@ class ChatterboxMultilingualTTS:
         min_p=0.05,
         top_p=1.0,
         chunk_size=12,
+        skip_watermark=False,
+        n_cfm_timesteps=None,
     ):
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
@@ -408,7 +413,7 @@ class ChatterboxMultilingualTTS:
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
         from .models.s3gen.s3gen_streamer import S3GenStreamer
-        streamer = S3GenStreamer(self.s3gen)
+        streamer = S3GenStreamer(self.s3gen, n_cfm_timesteps=n_cfm_timesteps)
         
         token_buffer = []
         chunk_index = 0
@@ -440,9 +445,9 @@ class ChatterboxMultilingualTTS:
                     audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=False)
                     
                     if audio_chunk is not None:
-                        audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
-                        # Note: we drop the final token's audio in generate, 
-                        # but in streaming we handle it via finalize=True in the streamer.
+                        if not skip_watermark:
+                            audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+                        
                         timing = {
                             'chunk_index': chunk_index,
                             'chunk_steps': chunk_tokens.shape[1],
@@ -462,10 +467,9 @@ class ChatterboxMultilingualTTS:
                 chunk_tokens = torch.cat(token_buffer, dim=1)
                 audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=True)
                 if audio_chunk is not None:
-                    audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
-                    # Apply the same 1-token trim logic as in generate()?
-                    # S3GenStreamer already handles lookahead. 
-                    # If finalize=True, it will include everything up to the end.
+                    if not skip_watermark:
+                        audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+                    
                     timing = {
                         'chunk_index': chunk_index,
                         'chunk_steps': chunk_tokens.shape[1],
@@ -481,3 +485,4 @@ class ChatterboxMultilingualTTS:
             if pending is not None:
                 p_audio, p_timing = pending
                 yield p_audio, self.sr, {**p_timing, 'is_final': True}
+

@@ -1,12 +1,12 @@
 """
 Регрессия baseline vs use_cuda_graph и стриминг vs полная генерация.
 
-По умолчанию фазы (Turbo-EN, MTL-RU, стриминг) выполняются в отдельных дочерних процессах,
+По умолчанию фазы (MTL-RU, стриминг) выполняются в отдельных дочерних процессах,
 чтобы после каждой фазы драйвер полностью освобождал VRAM (иначе на Windows/WSL возможен
 монотонный рост из-за кэша аллокатора CUDA и графов).
 
 Один процесс (как раньше): CHATTERBOX_REGRESSION_INPROC=1 uv run python verify_regression.py
-Отдельная фаза: uv run python verify_regression.py turbo_en
+Отдельная фаза: uv run python verify_regression.py mtl_ru
 """
 from __future__ import annotations
 
@@ -21,12 +21,10 @@ import numpy as np
 import torch
 
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-PHASE_TURBO_EN = "turbo_en"
 PHASE_MTL_RU = "mtl_ru"
 PHASE_STREAMING = "streaming"
-_PHASE_ORDER = (PHASE_TURBO_EN, PHASE_MTL_RU, PHASE_STREAMING)
+_PHASE_ORDER = (PHASE_MTL_RU, PHASE_STREAMING)
 
 
 def set_seed(seed: int) -> None:
@@ -79,30 +77,6 @@ def compare_wavs(wav1: torch.Tensor, wav2: torch.Tensor, name: str) -> bool:
     return False
 
 
-def phase_turbo_en(device: str = "cuda", seed: int = 42) -> bool:
-    print("\n[Testing Turbo TTS (English)]")
-    text_en = "The quick brown fox jumps over the lazy dog."
-
-    set_seed(seed)
-    model_turbo_base = ChatterboxTurboTTS.from_pretrained(device=device, use_cuda_graph=False)
-    wav_turbo_base_cpu = waveform_cpu_clone(
-        model_turbo_base.generate(text_en, temperature=0.001)
-    )
-    release_models(model_turbo_base)
-
-    set_seed(seed)
-    model_turbo_opt = ChatterboxTurboTTS.from_pretrained(device=device, use_cuda_graph=True)
-    wav_turbo_opt_cpu = waveform_cpu_clone(
-        model_turbo_opt.generate(text_en, temperature=0.001)
-    )
-    release_models(model_turbo_opt)
-
-    ok = compare_wavs(wav_turbo_base_cpu, wav_turbo_opt_cpu, "Turbo-EN")
-    del wav_turbo_base_cpu, wav_turbo_opt_cpu
-    free_cuda_memory()
-    return ok
-
-
 def phase_mtl_ru(device: str = "cuda", seed: int = 42) -> bool:
     print("\n[Testing Multilingual TTS (Russian)]")
     text_ru = "Быстрая коричневая лиса прыгает через ленивую собаку."
@@ -128,19 +102,19 @@ def phase_mtl_ru(device: str = "cuda", seed: int = 42) -> bool:
 
 
 def phase_streaming(device: str = "cuda", seed: int = 42) -> bool:
-    print("\n[Testing Streaming vs Non-streaming (Turbo)]")
-    text_st = "Streaming should be consistent with full generation."
+    print("\n[Testing Streaming vs Non-streaming (Multilingual)]")
+    text_st = "Потоковая передача должна быть согласована с полной генерацией."
     set_seed(seed)
-    model_turbo_stream = ChatterboxTurboTTS.from_pretrained(device=device, use_cuda_graph=True)
+    model_mtl_stream = ChatterboxMultilingualTTS.from_pretrained(device=device, use_cuda_graph=True)
     wav_full_cpu = waveform_cpu_clone(
-        model_turbo_stream.generate(text_st, temperature=0.001)
+        model_mtl_stream.generate(text_st, language_id="ru", temperature=0.001, skip_watermark=True)
     )
     free_cuda_memory()
 
     set_seed(seed)
     chunks = []
     last_timing = None
-    for chunk, sr, timing in model_turbo_stream.generate_streaming(text_st, temperature=0.001):
+    for chunk, sr, timing in model_mtl_stream.generate_streaming(text_st, language_id="ru", temperature=0.001, skip_watermark=True):
         chunks.append(chunk)
         last_timing = timing
     assert last_timing is not None and last_timing["is_final"] is True, (
@@ -150,12 +124,11 @@ def phase_streaming(device: str = "cuda", seed: int = 42) -> bool:
 
     ok = compare_wavs(wav_full_cpu, wav_stream, "Streaming-Consistency")
     del wav_full_cpu, wav_stream
-    release_models(model_turbo_stream)
+    release_models(model_mtl_stream)
     return ok
 
 
 _PHASE_RUNNERS: dict[str, Callable[[], bool]] = {
-    PHASE_TURBO_EN: lambda: phase_turbo_en(),
     PHASE_MTL_RU: lambda: phase_mtl_ru(),
     PHASE_STREAMING: lambda: phase_streaming(),
 }
@@ -163,7 +136,7 @@ _PHASE_RUNNERS: dict[str, Callable[[], bool]] = {
 
 def verify_in_process() -> bool:
     """Все фазы в одном процессе (для отладки или при CHATTERBOX_REGRESSION_INPROC=1)."""
-    results = [phase_turbo_en(), phase_mtl_ru(), phase_streaming()]
+    results = [phase_mtl_ru(), phase_streaming()]
     print("\n" + "=" * 40)
     if all(results):
         print("FINAL VERDICT: ALL REGRESSION TESTS PASSED")

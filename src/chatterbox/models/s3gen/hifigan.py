@@ -376,7 +376,8 @@ class HiFTGenerator(nn.Module):
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+        stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+        self.register_buffer("stft_window", stft_window, persistent=False)
         self.f0_predictor = f0_predictor
 
     def remove_weight_norm(self):
@@ -396,7 +397,7 @@ class HiFTGenerator(nn.Module):
     def _stft(self, x):
         spec = torch.stft(
             x,
-            self.istft_params["n_fft"], self.istft_params["hop_len"], self.istft_params["n_fft"], window=self.stft_window.to(x.device),
+            self.istft_params["n_fft"], self.istft_params["hop_len"], self.istft_params["n_fft"], window=self.stft_window,
             return_complex=True)
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
         return spec[..., 0], spec[..., 1]
@@ -406,7 +407,7 @@ class HiFTGenerator(nn.Module):
         real = magnitude * torch.cos(phase)
         img = magnitude * torch.sin(phase)
         inverse_transform = torch.istft(torch.complex(real, img), self.istft_params["n_fft"], self.istft_params["hop_len"],
-                                        self.istft_params["n_fft"], window=self.stft_window.to(magnitude.device))
+                                        self.istft_params["n_fft"], window=self.stft_window)
         return inverse_transform
 
     def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:

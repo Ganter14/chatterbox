@@ -105,25 +105,16 @@ class ConditionalCFM(BASECFM):
         cond_in = torch.zeros([2 * B, 80, T], device=x.device, dtype=x.dtype)
         r_in    = torch.zeros([2 * B       ], device=x.device, dtype=x.dtype) # (only used for meanflow)
 
+        has_graph = hasattr(self.estimator, 's3gen_graph') and self.estimator.s3gen_graph is not None
+        use_graph = has_graph and mu.size(2) <= self.estimator.s3gen_graph.max_frames
+        
+        if use_graph:
+            self.estimator.s3gen_graph.prepare(mu_in, mask_in, spks_in, cond_in)
+
         for t, r in zip(t_span[:-1], t_span[1:]):
             t = t.unsqueeze(dim=0)
             r = r.unsqueeze(dim=0)
-            # Shapes:
-            #      x_in  ( 2B, 80, T )
-            #   mask_in  ( 2B,  1, T )
-            #     mu_in  ( 2B, 80, T )
-            #      t_in  ( 2B,       )
-            #   spks_in  ( 2B, 80,   )
-            #   cond_in  ( 2B, 80, T )
-            #      r_in  ( 2B,       )
-            #         x  (  B, 80, T )
-            #      mask  (  B,  1, T )
-            #        mu  (  B, 80, T )
-            #         t  (  B,       )
-            #      spks  (  B, 80,   )
-            #      cond  (  B, 80, T )
-            #         r  (  B,       )
-
+            
             x_in[:B] = x_in[B:] = x
             mask_in[:B] = mask_in[B:] = mask
             mu_in[:B] = mu
@@ -131,10 +122,14 @@ class ConditionalCFM(BASECFM):
             spks_in[:B] = spks
             cond_in[:B] = cond
             r_in[:B] = r_in[B:] = r # (only used for meanflow)
-            dxdt = self.estimator.forward(
-                x=x_in, mask=mask_in, mu=mu_in, t=t_in, spks=spks_in, cond=cond_in,
-                r=r_in if meanflow else None,
-            )
+            
+            if use_graph:
+                dxdt = self.estimator.s3gen_graph.step(x_in, t_in, r_in)
+            else:
+                dxdt = self.estimator.forward(
+                    x=x_in, mask=mask_in, mu=mu_in, t=t_in, spks=spks_in, cond=cond_in,
+                    r=r_in if meanflow else None,
+                )
             dxdt, cfg_dxdt = torch.split(dxdt, [B, B], dim=0)
             dxdt = ((1.0 + self.inference_cfg_rate) * dxdt - self.inference_cfg_rate * cfg_dxdt)
             dt = r - t
@@ -213,7 +208,8 @@ class CausalConditionalCFM(ConditionalCFM):
         """
 
         B = mu.size(0)
-        z = torch.randn_like(mu)
+        # Use zero noise for perfect consistency
+        z = torch.zeros_like(mu)
 
         if noised_mels is not None:
             prompt_len = mu.size(2) - noised_mels.size(2)

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file as load_safetensors
 from huggingface_hub import snapshot_download
 import time
+import threading
 
 from .models.t3 import T3
 from .models.t3.modules.t3_config import T3Config
@@ -17,6 +18,7 @@ from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
+from .utils.streaming_utils import ThreadedS3GenStreamer
 
 
 REPO_ID = "ResembleAI/chatterbox"
@@ -180,6 +182,12 @@ class ChatterboxMultilingualTTS:
             from .models.t3.t3_graph import T3Graph
             self.t3.t3_graph = T3Graph(self.t3, batch_size=2, device=device)
             self.t3.t3_graph.capture()
+            
+            from .models.s3gen.s3gen_graph import S3GenGraph
+            estimator = self.s3gen.flow.decoder.estimator
+            self.s3gen_graph = S3GenGraph(estimator, max_frames=240, device=device)
+            self.s3gen_graph.capture()
+            estimator.s3gen_graph = self.s3gen_graph
 
     @classmethod
     def get_supported_languages(cls):
@@ -413,103 +421,114 @@ class ChatterboxMultilingualTTS:
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
         from .models.s3gen.s3gen_streamer import S3GenStreamer
-        streamer = S3GenStreamer(self.s3gen, n_cfm_timesteps=n_cfm_timesteps)
+        raw_streamer = S3GenStreamer(self.s3gen, n_cfm_timesteps=n_cfm_timesteps)
+        streamer = ThreadedS3GenStreamer(raw_streamer, self.conds.gen)
         
-        token_buffer = []
         chunk_index = 0
         start_time = time.time()
-        prefill_end_time = None
-        last_chunk_time = start_time
-        pending = None
-        stop_token = self.t3.hp.stop_speech_token
+        
+        # Shared state for the T3 thread
+        state = {
+            'prefill_end_time': None,
+            'exception': None,
+            'finished': False
+        }
 
-        with torch.inference_mode():
-            sos_token = self.t3.hp.start_speech_token
-            eos_token = self.t3.hp.stop_speech_token
-            started = True
-            for token in self.t3.inference_stream(
-                t3_cond=self.conds.t3,
-                text_tokens=text_tokens,
-                max_new_tokens=1000,
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-            ):
-                if prefill_end_time is None:
-                    prefill_end_time = time.time()
-
-                t_val = token.item()
-                print(f"DEBUG TOKEN: {t_val}")
-                if t_val == sos_token:
-                    started = True
-                    continue
-                if t_val == eos_token:
-                    break
-
-                if started and t_val < 6561:
-                    token_buffer.append(token)
-                
-                if len(token_buffer) >= chunk_size:
-                    chunk_tokens = torch.cat(token_buffer, dim=1)
-                    audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=False)
-                    
-                    if audio_chunk is not None:
-                        # Match full generate() behavior: apply trim_fade to the first chunk
-                        if chunk_index == 0 and hasattr(self.s3gen, 'trim_fade'):
-                            fade = self.s3gen.trim_fade.cpu().numpy()
-                            n = min(audio_chunk.shape[0], fade.shape[0])
-                            audio_chunk[:n] *= fade[:n]
-
-                        if not skip_watermark:
-                            audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
-                        
-                        timing = {
-                            'chunk_index': chunk_index,
-                            'chunk_steps': chunk_tokens.shape[1],
-                            'prefill_ms': (prefill_end_time - start_time) * 1000 if chunk_index == 0 else 0,
-                            'decode_ms': (time.time() - last_chunk_time) * 1000
-                        }
-                        if pending is not None:
-                            p_audio, p_timing = pending
-                            yield p_audio, self.sr, {**p_timing, 'is_final': False}
-                            last_chunk_time = time.time()
-                        pending = (audio_chunk, timing)
-                        chunk_index += 1
+        def t3_worker():
+            try:
+                with torch.inference_mode():
                     token_buffer = []
-
-            # Finalize
-            if token_buffer:
-                chunk_tokens = torch.cat(token_buffer, dim=1)
-                audio_chunk = streamer.stream(chunk_tokens, self.conds.gen, finalize=True)
-                if audio_chunk is not None:
-                    # Match full generate() behavior: drop the last token's audio
-                    if audio_chunk.shape[0] >= streamer.samples_per_token:
-                        audio_chunk = audio_chunk[:-streamer.samples_per_token]
-
-                    # Match full generate() behavior: apply trim_fade to the first chunk
-                    if chunk_index == 0 and hasattr(self.s3gen, 'trim_fade'):
-                        fade = self.s3gen.trim_fade.cpu().numpy()
-                        n = min(audio_chunk.shape[0], fade.shape[0])
-                        audio_chunk[:n] *= fade[:n]
-
-                    if not skip_watermark:
-                        audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+                    sos_token = self.t3.hp.start_speech_token
+                    eos_token = self.t3.hp.stop_speech_token
+                    started = True
                     
-                    timing = {
-                        'chunk_index': chunk_index,
-                        'chunk_steps': chunk_tokens.shape[1],
-                        'prefill_ms': (prefill_end_time - start_time) * 1000 if chunk_index == 0 else 0,
-                        'decode_ms': (time.time() - last_chunk_time) * 1000
-                    }
-                    if pending is not None:
-                        p_audio, p_timing = pending
-                        yield p_audio, self.sr, {**p_timing, 'is_final': False}
-                        last_chunk_time = time.time()
-                    pending = (audio_chunk, timing)
+                    for token in self.t3.inference_stream(
+                        t3_cond=self.conds.t3,
+                        text_tokens=text_tokens,
+                        max_new_tokens=1000,
+                        temperature=temperature,
+                        cfg_weight=cfg_weight,
+                        repetition_penalty=repetition_penalty,
+                        min_p=min_p,
+                        top_p=top_p,
+                    ):
+                        if state['prefill_end_time'] is None:
+                            state['prefill_end_time'] = time.time()
 
+                        t_val = token.item()
+                        if t_val == sos_token:
+                            started = True
+                            continue
+                        if t_val == eos_token:
+                            break
+
+                        if started and t_val < 6561:
+                            token_buffer.append(token)
+                        
+                        if len(token_buffer) >= chunk_size:
+                            streamer.push(torch.cat(token_buffer, dim=1), finalize=False)
+                            token_buffer = []
+
+                    # Finalize T3 stream
+                    if token_buffer:
+                        streamer.push(torch.cat(token_buffer, dim=1), finalize=True)
+                    else:
+                        streamer.push(torch.zeros((1, 0), dtype=torch.long, device=self.device), finalize=True)
+                
+                streamer.close()
+            except Exception as e:
+                state['exception'] = e
+            finally:
+                state['finished'] = True
+
+        t3_thread = threading.Thread(target=t3_worker, daemon=True)
+        t3_thread.start()
+
+        pending = None
+        while True:
+            if state['exception']:
+                raise state['exception']
+            
+            # Block until we get a chunk or worker finishes
+            res = streamer.get_chunk(timeout=0.01)
+            
+            if res is None: # Timeout
+                continue
+            
+            if streamer.is_sentinel(res):
+                break
+                
+            audio_chunk, chunk_steps, decode_ms, is_finalize = res
+            
+            # Match full generate() behavior: apply trim_fade to the first chunk
+            if chunk_index == 0 and hasattr(self.s3gen, 'trim_fade'):
+                fade = self.s3gen.trim_fade.cpu().numpy()
+                n = min(audio_chunk.shape[0], fade.shape[0])
+                audio_chunk[:n] *= fade[:n]
+            
+            # If it's the very last chunk of the whole stream, drop the last token's audio
+            if is_finalize:
+                if audio_chunk.shape[0] >= raw_streamer.samples_per_token:
+                    audio_chunk = audio_chunk[:-raw_streamer.samples_per_token]
+
+            if not skip_watermark:
+                audio_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+            
+            timing = {
+                'chunk_index': chunk_index,
+                'chunk_steps': chunk_steps,
+                'prefill_ms': (state['prefill_end_time'] - start_time) * 1000 if chunk_index == 0 and state['prefill_end_time'] else 0,
+                'decode_ms': decode_ms
+            }
+            
             if pending is not None:
                 p_audio, p_timing = pending
-                yield p_audio, self.sr, {**p_timing, 'is_final': True}
+                yield p_audio, self.sr, {**p_timing, 'is_final': False}
+            
+            pending = (audio_chunk, timing)
+            chunk_index += 1
+
+        if pending is not None:
+            p_audio, p_timing = pending
+            yield p_audio, self.sr, {**p_timing, 'is_final': True}
 

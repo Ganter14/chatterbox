@@ -103,7 +103,32 @@ flowchart LR
 
 Запуск из каталога `chatterbox/` (предпочтительно через `uv run python …`).
 
-1. **`verify_regression.py`**: Сравнивает baseline и `use_cuda_graph=True`. Успех: **`mse < 1e-3`**. По умолчанию фазы (Turbo-EN, MTL-RU, стриминг) выполняются в **отдельных подпроцессах**, чтобы драйвер полностью освобождал VRAM между фазами; отладка в одном процессе: `CHATTERBOX_REGRESSION_INPROC=1 uv run python verify_regression.py`. Одна фаза вручную: `uv run python verify_regression.py turbo_en` (или `mtl_ru`, `streaming`).
+1. **`verify_regression.py`**: Три независимые фазы, каждая — отдельный подпроцесс (сброс VRAM).
+
+   | Фаза | Что проверяет | Метрика / Порог |
+   |------|--------------|-----------------|
+   | `mtl_ru` | Паритет CUDA graphs: `use_cuda_graph=False` vs `True` | MSE < 1e-3 |
+   | `upstream_quality` | Деградация качества vs upstream resemble-ai/chatterbox | SQUIM-STOI ≥ 0.55 (fork и не хуже base на 0.1); WER fork ≤ max(35%, WER base + 15 п.п.); MCD — информационно |
+   | `streaming` | Качество стримингового аудио | SQUIM-STOI ≥ 0.55; длина в пределах ±5% от полной генерации; MSE — информационно |
+
+   `upstream_quality` пропускается (SKIP) если `CHATTERBOX_REGRESSION_BASELINE_PYTHON` не задан.
+   Подготовка upstream-venv: `bash setup_baseline.sh && export CHATTERBOX_REGRESSION_BASELINE_PYTHON=<путь>`.
+
+   Отладка в одном процессе: `CHATTERBOX_REGRESSION_INPROC=1 uv run python verify_regression.py`.
+   Одна фаза вручную: `uv run python verify_regression.py mtl_ru` (или `upstream_quality`, `streaming`).
+
+   > **Примечание по ODE-шуму**: форк намеренно использует `z = torch.zeros_like(mu)` вместо `randn`
+   > для детерминированности CUDA graphs. Из-за этого побитовое совпадение с upstream невозможно.
+   > **MCD** без DTW-выравнивания между системами с разными ODE-стартами всегда 20–40 dB независимо
+   > от качества — метрика выводится информационно и не входит в pass/fail.
+   > **WER** проверяется относительно: fork ≤ max(35%, WER baseline + 15 п.п.) — это нейтрализует
+   > ошибки Whisper на сложных русских словах (одинаковые у обоих систем).
+   >
+   > **Примечание по streaming MSE**: `S3GenStreamer` использует prompt caching (раздельное кодирование
+   > промпта для RTF) и stateful vocoder (`last_s`, для бесшовных переходов между чанками). Из-за этих
+   > оптимизаций MSE между streaming и `generate()` ≈ 0.026 — норма, не регрессия. Критерием качества
+   > стриминга служит SQUIM-STOI ≥ 0.55 и совпадение длины ±5%.
+
 2. **`benchmark_cuda.py`**: Замер времени `generate` и TTFC. Не допускать относительной просадки FPS.
 3. **`verify_update.py`**: Сквозная проверка (TTS + Whisper). Семантическое соответствие текста.
 
@@ -137,7 +162,7 @@ flowchart LR
 - [ ] Вы не изменили версии в `pyproject.toml`.
 - [ ] Изменения в модели T3 отражены в `src/chatterbox/models/t3/t3_graph.py` (статические буферы, размерность логитов).
 - [ ] В "горячем цикле" генерации не появилось вызовов, блокирующих CUDA Graph.
-- [ ] Прогнан `uv run python verify_regression.py` и MSE остался в пределах нормы.
+- [ ] Прогнан `uv run python verify_regression.py`: фаза `mtl_ru` (MSE < 1e-3) и `streaming` прошли; `upstream_quality` не упала ниже порогов (SQUIM-STOI / WER относительный).
 - [ ] `StaticCache` корректно сбрасывается (`.reset()`) перед новым prefill.
 
 ---

@@ -46,3 +46,8 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+
+# Benchmark results (machine-specific, tracked separately if needed)
+benchmarks/results/
+local_models/
+.env

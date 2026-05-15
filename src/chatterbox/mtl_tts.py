@@ -178,6 +178,18 @@ class ChatterboxMultilingualTTS:
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
 
+        # The CFM estimator runs in fp32 by design (S3Token2Wav.estimator_dtype),
+        # and the rest of the pipeline mixes fp32/bf16 matmuls. TF32 lets the
+        # Tensor Cores serve those fp32 GEMM/conv kernels on Ampere+ at the
+        # cost of ~1e-4 numeric drift, which is well below the perceptual
+        # threshold validated for the 2-step CFM Euler (cf. AGENTS.md). The
+        # flags are global and idempotent; setting them per-instance is safe.
+        _dev_type = device.type if isinstance(device, torch.device) else str(device)
+        if _dev_type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+
         if use_cuda_graph and device == "cuda":
             from .models.t3.t3_graph import T3Graph
             self.t3.t3_graph = T3Graph(self.t3, batch_size=2, device=device)

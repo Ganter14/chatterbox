@@ -19,8 +19,8 @@ import torch
 from benchmarks._model_loader import load_mtl_model
 from benchmarks._utils import (
     capture_vram_peak,
+    cuda_sync,
     free_cuda_memory,
-    measure_ttfc,
     release_models,
     set_seed,
 )
@@ -61,6 +61,12 @@ def _measure_phrase(
     chunk_size: int,
     seed: int,
 ) -> dict[str, Any]:
+    """Полный стриминг-прогон, ITERATIONS раз. TTFC берётся из времени до первого
+    yield генератора (а не из отдельного measure_ttfc). Это важно: отдельный
+    pre-run, прерванный break после первого чанка, не закрывает background
+    daemon-threads `t3_worker` / S3Gen-воркера, и они продолжают съедать GPU
+    в следующей итерации, искусственно завышая RTF.
+    """
     gen_kwargs = dict(language_id=language_id, chunk_size=chunk_size, skip_watermark=True)
 
     ttfc_samples: list[float] = []
@@ -70,32 +76,40 @@ def _measure_phrase(
 
     for _ in range(ITERATIONS):
         set_seed(seed)
-
-        ttfc_ms = measure_ttfc(model.generate_streaming, text=text, **gen_kwargs)
-        ttfc_samples.append(ttfc_ms)
-
-        set_seed(seed)
         chunks_info: list[dict] = []
         total_samples = 0
         sr = 22050
+        ttfc_ms: float | None = None
 
         with capture_vram_peak() as vram:
+            cuda_sync()
             t0 = time.perf_counter()
             for chunk, sr, timing in model.generate_streaming(text=text, **gen_kwargs):
+                if ttfc_ms is None:
+                    cuda_sync()
+                    ttfc_ms = (time.perf_counter() - t0) * 1000.0
                 total_samples += len(chunk)
                 chunks_info.append(timing)
+            cuda_sync()
             gen_time = time.perf_counter() - t0
         vram_peak_bytes.append(vram["peak_bytes"])
 
         audio_duration = total_samples / sr
         rtf_samples.append(gen_time / audio_duration if audio_duration > 0 else 0.0)
+        if ttfc_ms is not None:
+            ttfc_samples.append(ttfc_ms)
         decode_ms_all.extend(c["decode_ms"] for c in chunks_info if "decode_ms" in c)
+
+        # Дать background daemon-threads streaming pipeline спокойно завершиться
+        # перед следующей итерацией, иначе они конкурируют за GPU и пессимизируют
+        # как RTF, так и TTFC следующего прогона.
+        free_cuda_memory()
 
     return {
         "rtf_avg": float(np.mean(rtf_samples)),
         "rtf_pass": bool(np.mean(rtf_samples) < 1.0),
-        "ttfc_p50_ms": float(np.percentile(ttfc_samples, 50)),
-        "ttfc_p95_ms": float(np.percentile(ttfc_samples, 95)),
+        "ttfc_p50_ms": float(np.percentile(ttfc_samples, 50)) if ttfc_samples else 0.0,
+        "ttfc_p95_ms": float(np.percentile(ttfc_samples, 95)) if ttfc_samples else 0.0,
         "avg_chunk_decode_ms": float(np.mean(decode_ms_all)) if decode_ms_all else 0.0,
         "vram_peak_mb": round(max(vram_peak_bytes) / 1024 / 1024, 1),
         "iterations": ITERATIONS,

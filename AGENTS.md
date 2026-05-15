@@ -132,6 +132,16 @@ inferrable from the code alone.
    Do not suggest replacing uv with pip, and do not bypass the explicit
    PyTorch CUDA 12.8 index.
 
+10. **`ChatterboxMultilingualTTS` on CUDA alters global PyTorch precision
+    flags** the first time an instance is constructed: it sets
+    `torch.backends.cuda.matmul.allow_tf32`, `cudnn.allow_tf32`, and
+    `torch.set_float32_matmul_precision("high")`. These are **process-wide**
+    and **idempotent** (repeated constructions do not toggle them off).
+    If you change or gate this block, re-run `verify_regression.py mtl_ru`
+    (MSE budget 1e-3) and streaming/upstream phases as usual. Embedding MTL
+    alongside other CUDA models in one interpreter means all of them may
+    observe TF32 for eligible fp32 ops.
+
 ---
 
 ## Verification
@@ -222,6 +232,9 @@ export CHATTERBOX_MTL_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox
       [`s3gen.py`](src/chatterbox/models/s3gen/s3gen.py) is still `2`.
 - [ ] Any new RU WER measurement uses `whisper.load_model("medium")`
       (never `"small"`).
+- [ ] If `from_local` / S3Gen vocoder load path changes, MTL still calls
+      `mel2wav.remove_weight_norm()` and `f0_predictor.remove_weight_norm()`
+      after `load_state_dict` + `.eval()` (see ARCHITECTURE §2).
 
 ---
 

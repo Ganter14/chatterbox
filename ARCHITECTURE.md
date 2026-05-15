@@ -133,6 +133,26 @@ subsequent `generate*` call until replaced.
   - Available on `ChatterboxTurboTTS` and `ChatterboxMultilingualTTS`.
   - Not available on `ChatterboxTTS` — watermark is always applied.
 
+- **Multilingual-only runtime defaults** (`mtl_tts.py`):
+  - **TF32 + matmul precision**: `ChatterboxMultilingualTTS.__init__` enables
+    `torch.backends.cuda.matmul.allow_tf32`, `cudnn.allow_tf32`, and
+    `torch.set_float32_matmul_precision("high")` when the target device is CUDA.
+    This accelerates fp32 paths (notably the CFM `ConditionalDecoder` while
+    `estimator_dtype` stays fp32). The knobs are **process-global**;
+    constructing MTL in an interpreter can change numerics for unrelated PyTorch
+    code in the same process.
+  - **HiFT + F0 `weight_norm` collapse**: `from_local()` calls
+    `s3gen.mel2wav.remove_weight_norm()` and
+    `s3gen.mel2wav.f0_predictor.remove_weight_norm()` immediately after
+    `load_state_dict` and `.to(device).eval()`. The vocoder wraps most conv
+    layers in `torch.nn.utils.parametrizations.weight_norm`, which would
+    otherwise recompute the effective weight on every forward. The implementation
+    uses `torch.nn.utils.parametrize.remove_parametrizations(..., leave_parametrized=True)`
+    (not the legacy `torch.nn.utils.remove_weight_norm`, which does not match
+    the parametrizations API). **`from_pretrained` → `from_local` is the only
+    production load path that applies this**; ad-hoc construction of `S3Gen`
+    without going through `from_local` keeps the parametrizations.
+
 ---
 
 ## 3. T3 Inference: StaticCache + CUDA Graphs
@@ -307,7 +327,7 @@ streams.
 Code: [`src/chatterbox/models/s3gen/s3gen_streamer.py`](src/chatterbox/models/s3gen/s3gen_streamer.py).
 
 Stateful wrapper around `S3Gen.flow_inference()` and
-`S3Gen.hift_inference()`. Carries three pieces of state across chunks:
+`S3Gen.hift_inference()`. Carries the following state across chunks:
 
 1. **Pre-encoded prompt** (`prompt_enc`, `prompt_mask`). The reference
    voice tokens are run through `flow.input_embedding` and
@@ -323,6 +343,12 @@ Stateful wrapper around `S3Gen.flow_inference()` and
 3. **Vocoder source state** (`last_s`). HiFT-GAN's source-signal output
    from the previous chunk is fed back via `hift_inference(..., cache_source=self.last_s)`,
    so chunk boundaries do not introduce phase discontinuities or clicks.
+
+4. **Host copy**: After `hift_inference`, only the audio **tail** not yet
+   yielded—`output_wavs[0, prev_audio_len:]`—is copied to NumPy. The full
+   sliding-window waveform (tens of ms × sample rate) stays on GPU until
+   discarded; this is an I/O optimization only and does not change sample
+   values relative to copying the full tensor then slicing on CPU.
 
 Lookahead trimming (`pre_lookahead=3`) is required by the causal CFM:
 the last three tokens of every non-final chunk are held back and only

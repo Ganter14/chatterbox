@@ -230,6 +230,15 @@ class ChatterboxMultilingualTTS:
         )
         s3gen.to(device).eval()
 
+        # Collapse weight_norm parametrizations on the vocoder hot path.
+        # HiFTGenerator + ConvRNNF0Predictor both run per-chunk in streaming;
+        # the parametrization recomputes weights on every forward, which is
+        # pure inference overhead. Both classes expose remove_weight_norm()
+        # explicitly; the call mutates parameters in-place, so it must come
+        # after load_state_dict and the .to(device).eval() move.
+        s3gen.mel2wav.remove_weight_norm()
+        s3gen.mel2wav.f0_predictor.remove_weight_norm()
+
         tokenizer = MTLTokenizer(
             str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json")
         )

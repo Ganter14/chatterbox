@@ -24,8 +24,20 @@ import torch
 import torch.nn.functional as F
 from torch.nn import Conv1d
 from torch.nn import ConvTranspose1d
-from torch.nn.utils import remove_weight_norm
+from torch.nn.utils.parametrize import remove_parametrizations
 from torch.nn.utils.parametrizations import weight_norm
+
+
+def _drop_weight_norm(module):
+    # The codebase uses torch.nn.utils.parametrizations.weight_norm (the new
+    # parametrization-based API), but the legacy torch.nn.utils.remove_weight_norm
+    # only understands the pre-2.1 weight_v/weight_g attribute layout and raises
+    # `weight_norm of 'weight' not found` against ParametrizedConv* modules.
+    # remove_parametrizations(..., leave_parametrized=True) is the matching
+    # remover: it materializes the computed weight and detaches the
+    # parametrization so forward() stops recomputing on every call.
+    if hasattr(module, "parametrizations") and "weight" in module.parametrizations:
+        remove_parametrizations(module, "weight", leave_parametrized=True)
 from torch.distributions.uniform import Uniform
 from torch import nn, sin, pow
 from torch.nn import Parameter
@@ -162,8 +174,8 @@ class ResBlock(torch.nn.Module):
 
     def remove_weight_norm(self):
         for idx in range(len(self.convs1)):
-            remove_weight_norm(self.convs1[idx])
-            remove_weight_norm(self.convs2[idx])
+            _drop_weight_norm(self.convs1[idx])
+            _drop_weight_norm(self.convs2[idx])
 
 
 class SineGen(torch.nn.Module):
@@ -282,6 +294,12 @@ class SourceModuleHnNSF(torch.nn.Module):
         noise = torch.randn_like(uv) * self.sine_amp / 3
         return sine_merge, noise, uv
 
+    def remove_weight_norm(self):
+        # No weight_norm-wrapped sub-modules: l_linear is plain nn.Linear,
+        # l_sin_gen has no parameters. Defined so HiFTGenerator.remove_weight_norm
+        # can call self.m_source.remove_weight_norm() unconditionally.
+        return
+
 
 class HiFTGenerator(nn.Module):
     """
@@ -381,16 +399,15 @@ class HiFTGenerator(nn.Module):
         self.f0_predictor = f0_predictor
 
     def remove_weight_norm(self):
-        print('Removing weight norm...')
         for l in self.ups:
-            remove_weight_norm(l)
+            _drop_weight_norm(l)
         for l in self.resblocks:
             l.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
+        _drop_weight_norm(self.conv_pre)
+        _drop_weight_norm(self.conv_post)
         self.m_source.remove_weight_norm()
         for l in self.source_downs:
-            remove_weight_norm(l)
+            _drop_weight_norm(l)
         for l in self.source_resblocks:
             l.remove_weight_norm()
 

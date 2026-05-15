@@ -13,6 +13,7 @@
 # limitations under the License.
 import torch
 import torch.nn as nn
+from torch.nn.utils.parametrize import remove_parametrizations
 from torch.nn.utils.parametrizations import weight_norm
 
 
@@ -53,3 +54,11 @@ class ConvRNNF0Predictor(nn.Module):
         x = self.condnet(x)
         x = x.transpose(1, 2)
         return torch.abs(self.classifier(x).squeeze(-1))
+
+    def remove_weight_norm(self):
+        # Materialize and detach the parametrization from each Conv1d in condnet
+        # so forward() stops recomputing weight on every call. ELU layers carry
+        # no parameters; the final classifier Linear is unwrapped.
+        for layer in self.condnet:
+            if isinstance(layer, nn.Conv1d) and hasattr(layer, "parametrizations") and "weight" in layer.parametrizations:
+                remove_parametrizations(layer, "weight", leave_parametrized=True)

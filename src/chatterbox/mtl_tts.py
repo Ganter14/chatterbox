@@ -386,7 +386,7 @@ class ChatterboxMultilingualTTS:
         top_p=1.0,
         chunk_size=12,
         skip_watermark=False,
-        n_cfm_timesteps=None,
+        n_cfm_timesteps=2,
     ):
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:

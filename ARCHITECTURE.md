@@ -36,11 +36,11 @@ flowchart LR
 
 There are three high-level entry points, none of them symmetric:
 
-| Class | Module | T3 backbone | CUDA Graphs | Streaming |
-|---|---|---|---|---|
-| `ChatterboxTTS` (EN) | [`src/chatterbox/tts.py`](src/chatterbox/tts.py) | GPT-2 medium + learned speech pos-emb | not wired | sync |
-| `ChatterboxTurboTTS` (EN) | [`src/chatterbox/tts_turbo.py`](src/chatterbox/tts_turbo.py) | GPT-2 medium (Turbo) | T3Graph(B=1) | sync |
-| `ChatterboxMultilingualTTS` | [`src/chatterbox/mtl_tts.py`](src/chatterbox/mtl_tts.py) | Llama_520M | T3Graph(B=2) + S3GenGraph | threaded |
+| Class | Module | T3 backbone | CUDA Graphs | Streaming | Status |
+|---|---|---|---|---|---|
+| `ChatterboxTTS` (EN) | [`src/chatterbox/tts.py`](src/chatterbox/tts.py) | GPT-2 medium + learned speech pos-emb | not wired | sync | upstream only, not maintained |
+| `ChatterboxTurboTTS` (EN) | [`src/chatterbox/tts_turbo.py`](src/chatterbox/tts_turbo.py) | GPT-2 medium (Turbo) | T3Graph(B=1) | sync | upstream only, not maintained |
+| `ChatterboxMultilingualTTS` | [`src/chatterbox/mtl_tts.py`](src/chatterbox/mtl_tts.py) | Llama_520M | T3Graph(B=2) + S3GenGraph | threaded | **active target** |
 
 `ChatterboxTurboTTS` is intentionally not re-exported from
 [`src/chatterbox/__init__.py`](src/chatterbox/__init__.py).
@@ -54,6 +54,11 @@ lives in [`src/chatterbox/models/t3/inference/t3_hf_backend.py`](src/chatterbox/
 ---
 
 ## 2. Model Zoo: what differs between the three classes
+
+> **Scope note.** Only `ChatterboxMultilingualTTS` is the active
+> development target of this fork. The subsections on `ChatterboxTTS`
+> and `ChatterboxTurboTTS` are preserved for reference; do not modify
+> those classes or their tests in this fork.
 
 The three TTS classes are similar at a glance but have small, important
 differences. Treat them as siblings, not as a single hierarchy.
@@ -95,10 +100,19 @@ subsequent `generate*` call until replaced.
     batch (`B=2`) so the conditional and unconditional forward share a
     single graph replay.
 
-- **S3Gen meanflow**:
-  - Turbo loads S3Gen with `meanflow=True` and uses 2 CFM timesteps
-    (distilled model).
-  - The other two use 10 CFM timesteps (regular model).
+- **S3Gen meanflow & CFM timestep budget**:
+  - Turbo loads S3Gen with `meanflow=True` (distilled model).
+  - **Fork default for all paths: 2 CFM Euler steps** (set in
+    `S3Token2Wav.flow_inference`, see
+    [`src/chatterbox/models/s3gen/s3gen.py`](src/chatterbox/models/s3gen/s3gen.py)).
+    Upstream defaulted to 10 for the regular CFM model. Empirical
+    verification on MTL-RU (Whisper-medium WER, SQUIM-STOI, perceptual
+    A/B on short/medium/long phrases) showed 2 vs 10 produce different
+    ODE trajectories (mel-spectrogram L1 ≈ 0.9 in log10 domain) but no
+    audible degradation. 2 steps reduce S3GenGraph replays per chunk
+    by 5x, which is what lets MTL streaming hit RTF < 1.0. Override
+    via `n_cfm_timesteps=` only if you suspect ODE-induced artifacts on
+    a specific voice or text.
 
 - **Tail trim in `generate()`**:
   - Multilingual drops the last speech token's audio
@@ -235,8 +249,9 @@ S3Gen turns speech tokens into a waveform in two stages: a flow-matching
 
 Code: [`src/chatterbox/models/s3gen/s3gen_graph.py`](src/chatterbox/models/s3gen/s3gen_graph.py).
 
-The CFM decoder runs a small ODE (default 10 Euler steps, 2 for Turbo's
-meanflow). The most expensive component inside that loop is the
+The CFM decoder runs a small ODE (fork default: 2 Euler steps for both
+the regular CFM model and Turbo's meanflow — see §"S3Gen meanflow & CFM
+timestep budget"). The most expensive component inside that loop is the
 estimator — a UNet-style `ConditionalDecoder`. Each ODE step calls the
 estimator with constant inputs (`mu`, `mask`, `spks`, `cond`) and
 time-varying inputs (`x`, `t`, `r`). That is a perfect graph target.
@@ -463,7 +478,7 @@ proper benchmark surface; consult it instead of hand-typed tables.
 
 | Question | Tool | Output |
 |---|---|---|
-| Did CUDA Graphs actually speed things up? | [`benchmark_cuda.py`](benchmark_cuda.py) → `benchmarks/cuda.py` | wall-clock, TTFC, peak VRAM, optional vs-upstream speedup |
+| Did CUDA Graphs actually speed things up? | [`benchmark_cuda.py`](benchmark_cuda.py) → `benchmarks/cuda.py` | full-gen time, TTFC, peak VRAM for `ChatterboxMultilingualTTS`; optional vs-upstream speedup |
 | Does streaming stay real-time? | [`benchmark_rtf.py`](benchmark_rtf.py) → `benchmarks/rtf.py` | RTF, TTFC p50/p95, per-chunk decode |
 | Did an optimization break the audio? | [`verify_regression.py`](verify_regression.py) | 3-phase regression (`mtl_ru` / `upstream_quality` / `streaming`) |
 

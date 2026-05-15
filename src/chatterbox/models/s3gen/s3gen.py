@@ -319,7 +319,12 @@ class S3Token2Wav(S3Token2Mel):
         prompt_enc=None,
         prompt_mask=None,
     ):
-        n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
+        # Fork default: 2 ODE-шага для всех путей (meanflow и обычный CFM).
+        # Эмпирическая проверка (Whisper-medium + SQUIM-STOI + мел-L1) показала,
+        # что для MTL переход с 10 шагов на 2 не даёт слышимой деградации, при этом
+        # уменьшает число replay() в S3GenGraph в 5x и позволяет стримингу
+        # уложиться в RTF < 1.0. См. ARCHITECTURE.md §"S3Gen flow defaults".
+        n_cfm_timesteps = n_cfm_timesteps or 2
         noise = None
         if self.meanflow:
             noise = torch.randn(1, 80, speech_tokens.size(-1) * 2, dtype=self.dtype, device=self.device)

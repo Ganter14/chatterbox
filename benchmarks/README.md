@@ -5,6 +5,10 @@ Chatterbox TTS fork.
 
 ## Purpose
 
+> **Scope.** All benchmarks in this fork target `ChatterboxMultilingualTTS`.
+> The `benchmarks/cuda.py` Turbo-EN case has been removed; `_model_loader.load_turbo_model`
+> is retained only for upstream-venv compatibility.
+
 The module answers two independent questions, with a third regression
 check living one level up:
 
@@ -69,7 +73,6 @@ CHATTERBOX_REGRESSION_INPROC=1 uv run python verify_regression.py
 | Variable | Used by | Purpose |
 |---|---|---|
 | `CHATTERBOX_MTL_MODEL_DIR` | all benchmarks, `verify_regression.py` | Local directory with weights of the MTL model (`ResembleAI/chatterbox`). When set, Hugging Face is not contacted. |
-| `CHATTERBOX_TURBO_MODEL_DIR` | `benchmark_cuda.py` | Local directory with weights of the Turbo model (`ResembleAI/chatterbox-turbo`). |
 | `CHATTERBOX_REGRESSION_BASELINE_PYTHON` | `verify_regression.py`, `benchmark_cuda.py` | Path to a `python` from the upstream venv. **Required** for the `upstream_quality` regression phase and for the speedup column of the CUDA benchmark. |
 | `CHATTERBOX_REGRESSION_INPROC` | `verify_regression.py` | When `1`, all phases run in a single process (no VRAM reset between phases). Debug only. |
 | `CHATTERBOX_BASELINE_VENV` | `setup_baseline.sh` | Path to the baseline venv (default `../chatterbox-baseline-venv`). |
@@ -81,24 +84,18 @@ When Hugging Face access is unstable or blocked, download the weights
 once:
 
 ```bash
-# Download both models (~5–8 GB) into ~/.local/share/chatterbox-models/
-uv run python download_models.py
+# Download the MTL model (~5–8 GB) into ~/.local/share/chatterbox-models/
+uv run python download_models.py --model mtl
 
 # Or into a custom directory
-uv run python download_models.py --output-dir /data/models
+uv run python download_models.py --model mtl --output-dir /data/models
 
-# Only MTL or only Turbo
-uv run python download_models.py --model mtl
-uv run python download_models.py --model turbo
-
-# The script prints export lines — append them to ~/.bashrc / ~/.zshrc
+# The script prints the export line — append it to ~/.bashrc / ~/.zshrc
 export CHATTERBOX_MTL_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox
-export CHATTERBOX_TURBO_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox-turbo
 ```
 
 From that point on, every benchmark and `verify_regression.py`
-automatically uses the local weights. The variables
-`CHATTERBOX_MTL_MODEL_DIR` / `CHATTERBOX_TURBO_MODEL_DIR` are also
+automatically uses the local weights. `CHATTERBOX_MTL_MODEL_DIR` is also
 forwarded into the upstream-baseline subprocess workers.
 
 ### Bootstrap the upstream baseline in one command

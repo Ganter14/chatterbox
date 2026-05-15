@@ -85,13 +85,19 @@ class S3GenStreamer:
         
         # Vocoder inference with caching for continuity
         output_wavs, self.last_s = self.s3gen.hift_inference(output_mels, cache_source=self.last_s)
-        
-        # Convert to numpy and trim what we already yielded
-        wav = output_wavs.squeeze(0).detach().cpu().numpy()
-        
-        new_audio = wav[self.prev_audio_len:]
-        self.prev_audio_len = len(wav)
-        
+
+        # output_wavs is (1, total_samples) on GPU; we only need the tail past
+        # what previous chunks already yielded. Sliding the window leaves us
+        # with prev_audio_len already aligned to the surviving prefix (see the
+        # overflow branch above), so the slice is well-defined.
+        # Slice on GPU so the host copy is just the new audio, not the full
+        # ~57 KB window; this also avoids forcing cudaSynchronize on samples
+        # the consumer is going to discard immediately.
+        total_samples = output_wavs.shape[-1]
+        new_audio_gpu = output_wavs[0, self.prev_audio_len:total_samples].contiguous()
+        new_audio = new_audio_gpu.detach().cpu().numpy()
+        self.prev_audio_len = total_samples
+
         return new_audio
 
 

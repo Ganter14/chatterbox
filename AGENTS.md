@@ -17,6 +17,10 @@ CUDA Graphs for the T3 autoregressive decode loop, a CUDA Graph for the
 S3Gen flow-matching estimator, and a streaming pipeline with stateful
 vocoder and prompt caching.
 
+**Active development target: `ChatterboxMultilingualTTS` only.**
+`ChatterboxTTS` and `ChatterboxTurboTTS` remain in the codebase as upstream
+code but are not actively developed, optimized, or tested in this fork.
+
 ---
 
 ## Environment
@@ -41,11 +45,11 @@ All scripts are launched as `uv run python ...`.
 
 ## Public entry points (asymmetric!)
 
-| Class | Module | T3 backbone | `use_cuda_graph` | `generate_streaming` |
-|---|---|---|---|---|
-| `ChatterboxTTS` (EN) | [`src/chatterbox/tts.py`](src/chatterbox/tts.py) | GPT-2 medium + learned speech pos-emb | **NO** (not wired) | synchronous |
-| `ChatterboxTurboTTS` (EN) | [`src/chatterbox/tts_turbo.py`](src/chatterbox/tts_turbo.py) | GPT-2 medium (Turbo config) | yes, `T3Graph(batch_size=1)` | synchronous |
-| `ChatterboxMultilingualTTS` (23 languages incl. RU) | [`src/chatterbox/mtl_tts.py`](src/chatterbox/mtl_tts.py) | Llama_520M | yes, `T3Graph(batch_size=2)` + `S3GenGraph` | threaded |
+| Class | Module | T3 backbone | `use_cuda_graph` | `generate_streaming` | Status |
+|---|---|---|---|---|---|
+| `ChatterboxTTS` (EN) | [`src/chatterbox/tts.py`](src/chatterbox/tts.py) | GPT-2 medium + learned speech pos-emb | **NO** (not wired) | synchronous | upstream only, not maintained |
+| `ChatterboxTurboTTS` (EN) | [`src/chatterbox/tts_turbo.py`](src/chatterbox/tts_turbo.py) | GPT-2 medium (Turbo config) | yes, `T3Graph(batch_size=1)` | synchronous | upstream only, not maintained |
+| `ChatterboxMultilingualTTS` (23 languages incl. RU) | [`src/chatterbox/mtl_tts.py`](src/chatterbox/mtl_tts.py) | Llama_520M | yes, `T3Graph(batch_size=2)` + `S3GenGraph` | threaded | **active target** |
 
 Notes:
 
@@ -66,7 +70,7 @@ Read [`ARCHITECTURE.md`](ARCHITECTURE.md) **before** touching any of:
 - [`src/chatterbox/models/s3gen/s3gen_graph.py`](src/chatterbox/models/s3gen/s3gen_graph.py) — S3Gen estimator CUDA Graph
 - [`src/chatterbox/models/s3gen/s3gen_streamer.py`](src/chatterbox/models/s3gen/s3gen_streamer.py) — streaming with prompt cache + stateful vocoder
 - [`src/chatterbox/utils/streaming_utils.py`](src/chatterbox/utils/streaming_utils.py) — `ThreadedS3GenStreamer` (MTL streaming)
-- `generate_streaming` of any of the three `*_tts.py` files
+- `generate_streaming` of [`src/chatterbox/mtl_tts.py`](src/chatterbox/mtl_tts.py)
 - [`src/chatterbox/models/s3gen/flow_matching.py`](src/chatterbox/models/s3gen/flow_matching.py) — CFM ODE start (`z = zeros_like(mu)` is intentional)
 - [`src/chatterbox/models/t3/t3.py`](src/chatterbox/models/t3/t3.py) inference loops (decode hot path)
 
@@ -99,8 +103,8 @@ inferrable from the code alone.
    `batch_size=2` (conditional + unconditional in one batch). Do not
    split into two separate graphs.
 
-5. **`generate_streaming` API is public**. New parameters must have
-   defaults that preserve current behaviour.
+5. **`ChatterboxMultilingualTTS.generate_streaming` API is public**. New
+   parameters must have defaults that preserve current behaviour.
 
 6. **CFM ODE start**: the fork uses
    `z = torch.zeros_like(mu)` (see
@@ -109,7 +113,22 @@ inferrable from the code alone.
    `randn`. It breaks bit-parity with upstream by design — that is why
    `verify_regression.py` uses *relative* metrics, not bit-equality.
 
-7. **Add dependencies via `pyproject.toml`** and the existing uv policy.
+7. **CFM Euler steps default = 2** (set in
+   [`src/chatterbox/models/s3gen/s3gen.py`](src/chatterbox/models/s3gen/s3gen.py)
+   `S3Token2Wav.flow_inference`). This is the fork-wide default for both
+   regular CFM and meanflow paths. Do not raise it back to 10 without
+   re-running the empirical perceptual / Whisper-medium check that
+   justified the drop. If you need to experiment with another value,
+   pass `n_cfm_timesteps=` explicitly at the call site instead of
+   editing the dispatch line.
+
+8. **Whisper model = `medium`** for any RU WER measurement
+   (`verify_regression.py`, future quality benchmarks). `whisper-small`
+   was found to hallucinate end-of-utterance words on this codec
+   (e.g. inventing «синтезоритии») and **must not** be used as a
+   quality gate. `medium` is the minimum reliable transcriber for RU.
+
+9. **Add dependencies via `pyproject.toml`** and the existing uv policy.
    Do not suggest replacing uv with pip, and do not bypass the explicit
    PyTorch CUDA 12.8 index.
 
@@ -179,9 +198,8 @@ commit and GPU model. Browse history with
 ### Offline weights (no Hugging Face at runtime)
 
 ```bash
-uv run python download_models.py
+uv run python download_models.py --model mtl
 export CHATTERBOX_MTL_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox
-export CHATTERBOX_TURBO_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox-turbo
 ```
 
 ---
@@ -200,6 +218,10 @@ export CHATTERBOX_TURBO_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox-tu
       green; `upstream_quality` either green or SKIPPED.
 - [ ] `StaticCache.reset()` is called before every new prefill.
 - [ ] No new `randn` introduced into the CFM ODE start.
+- [ ] Default `n_cfm_timesteps` in
+      [`s3gen.py`](src/chatterbox/models/s3gen/s3gen.py) is still `2`.
+- [ ] Any new RU WER measurement uses `whisper.load_model("medium")`
+      (never `"small"`).
 
 ---
 

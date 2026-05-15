@@ -144,7 +144,12 @@ def _wer(ref: str, hyp: str) -> float:
 
 
 def _whisper_wer(wav: torch.Tensor, ref_text: str, sr: int) -> float | None:
-    """Транскрибирует аудио через Whisper, возвращает WER vs ref_text."""
+    """Транскрибирует аудио через Whisper-medium, возвращает WER vs ref_text.
+
+    ВАЖНО: используется именно `medium`, а не `small`. На этом TTS-кодеке
+    `whisper-small` склонен к галлюцинациям финальных слов (см. AGENTS.md,
+    hard rule №8). Для русского `medium` — минимальный надёжный размер.
+    """
     try:
         import whisper
         import torchaudio
@@ -153,7 +158,7 @@ def _whisper_wer(wav: torch.Tensor, ref_text: str, sr: int) -> float | None:
             wav16 = resamp(wav.cpu().float()).squeeze().numpy()
         else:
             wav16 = wav.cpu().float().squeeze().numpy()
-        w_model = whisper.load_model("small")
+        w_model = whisper.load_model("medium")
         result = w_model.transcribe(wav16, language="ru")
         hyp = result["text"].strip()
         print(f"  Whisper: {hyp!r}")

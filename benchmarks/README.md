@@ -1,110 +1,119 @@
 # benchmarks/
 
-Инфраструктура измерения производительности и регрессионного тестирования для форка Chatterbox TTS.
+Performance measurement and regression testing infrastructure for the
+Chatterbox TTS fork.
 
-## Назначение
+## Purpose
 
-Модуль отвечает на два независимых вопроса:
+The module answers two independent questions, with a third regression
+check living one level up:
 
-| Скрипт / модуль | Вопрос |
+| Script / module | Question |
 |---|---|
-| `benchmarks/cuda.py` | Насколько CUDA Graphs ускорили генерацию? |
-| `benchmarks/rtf.py` | Работает ли стриминг в реальном времени (RTF < 1.0)? |
-| `verify_regression.py` (корень) | Не сломала ли оптимизация аудиовыход? (MSE) |
+| `benchmarks/cuda.py` | How much did CUDA Graphs speed generation up? |
+| `benchmarks/rtf.py` | Does streaming run in real time (RTF < 1.0)? |
+| `verify_regression.py` (repo root) | Did an optimization break the audio? (MSE / SQUIM / WER) |
 
 ---
 
-## Структура файлов
+## File layout
 
 ```
 benchmarks/
   __init__.py
-  _utils.py                    — общие примитивы: set_seed, free_cuda, Timer,
+  _utils.py                    — shared primitives: set_seed, free_cuda, Timer,
                                   capture_vram_peak, measure_ttfc
-  _results.py                  — JSON-персистентность: save(), load_history(),
-                                  git-метаданные, GPU info
-  _baseline_waveform_worker.py — subprocess-воркер под upstream-venv;
-                                  сохраняет .npy с волной (для verify_regression.py)
-  _baseline_timing_worker.py   — subprocess-воркер под upstream-venv;
-                                  сохраняет timing JSON (для benchmarks/cuda.py)
-  cuda.py                      — бенчмарк full-gen time, TTFC, VRAM, опц. speedup
-  rtf.py                       — бенчмарк RTF, TTFC p50/p95, avg chunk decode
-  results/                     — сохранённые JSON-прогоны (в .gitignore)
+  _results.py                  — JSON persistence: save(), load_history(),
+                                  git metadata, GPU info
+  _baseline_waveform_worker.py — subprocess worker spawned under the
+                                  upstream venv; saves waveform .npy
+                                  (consumed by verify_regression.py)
+  _baseline_timing_worker.py   — subprocess worker spawned under the
+                                  upstream venv; saves timing JSON
+                                  (consumed by benchmarks/cuda.py)
+  _model_loader.py             — fork-side helpers for loading MTL/Turbo models
+  cuda.py                      — benchmark: full-gen time, TTFC, peak VRAM,
+                                  optional vs-upstream speedup
+  rtf.py                       — benchmark: RTF, TTFC p50/p95, per-chunk decode
+  results/                     — saved JSON runs (gitignored)
 ```
 
 ---
 
-## Запуск
+## Running
 
-Из корня репозитория (через `uv run`):
+Run from the repository root via `uv run`:
 
 ```bash
-# Бенчмарк CUDA Graphs (full-gen time, TTFC, VRAM)
+# CUDA Graphs benchmark (full-gen time, TTFC, peak VRAM)
 uv run python benchmark_cuda.py
 
-# Бенчмарк RTF стриминга
+# Streaming RTF benchmark
 uv run python benchmark_rtf.py
 
-# Регрессия: MSE форка vs upstream baseline
+# Regression: fork waveform vs upstream baseline
 uv run python verify_regression.py
 
-# Отдельная фаза регрессии
+# Single regression phase
 uv run python verify_regression.py mtl_ru
 uv run python verify_regression.py streaming
 
-# Все фазы в одном процессе (для отладки)
+# Run all phases in a single process (debug only)
 CHATTERBOX_REGRESSION_INPROC=1 uv run python verify_regression.py
 ```
 
 ---
 
-## Переменные окружения
+## Environment variables
 
-| Переменная | Кто использует | Описание |
+| Variable | Used by | Purpose |
 |---|---|---|
-| `CHATTERBOX_MTL_MODEL_DIR` | все бенчмарки, `verify_regression.py` | Путь к локальной директории весов MTL-модели (`ResembleAI/chatterbox`). Если задан — HuggingFace не используется. |
-| `CHATTERBOX_TURBO_MODEL_DIR` | `benchmark_cuda.py` | Путь к локальной директории весов Turbo-модели (`ResembleAI/chatterbox-turbo`). |
-| `CHATTERBOX_REGRESSION_BASELINE_PYTHON` | `verify_regression.py`, `benchmark_cuda.py` | Путь к `python` из upstream-venv. **Обязателен** для фазы `upstream_quality` и для speedup-колонки в CUDA-бенчмарке. |
-| `CHATTERBOX_REGRESSION_INPROC` | `verify_regression.py` | Если `1` — все фазы в одном процессе (без очистки VRAM между фазами). Только для отладки. |
-| `CHATTERBOX_BASELINE_VENV` | `setup_baseline.sh` | Путь к venv baseline (по умолчанию `../chatterbox-baseline-venv`). |
-| `CHATTERBOX_UPSTREAM_REF` | `setup_baseline.sh` | Тег/коммит/ветка upstream (по умолчанию `master`). |
+| `CHATTERBOX_MTL_MODEL_DIR` | all benchmarks, `verify_regression.py` | Local directory with weights of the MTL model (`ResembleAI/chatterbox`). When set, Hugging Face is not contacted. |
+| `CHATTERBOX_TURBO_MODEL_DIR` | `benchmark_cuda.py` | Local directory with weights of the Turbo model (`ResembleAI/chatterbox-turbo`). |
+| `CHATTERBOX_REGRESSION_BASELINE_PYTHON` | `verify_regression.py`, `benchmark_cuda.py` | Path to a `python` from the upstream venv. **Required** for the `upstream_quality` regression phase and for the speedup column of the CUDA benchmark. |
+| `CHATTERBOX_REGRESSION_INPROC` | `verify_regression.py` | When `1`, all phases run in a single process (no VRAM reset between phases). Debug only. |
+| `CHATTERBOX_BASELINE_VENV` | `setup_baseline.sh` | Path to the baseline venv (default `../chatterbox-baseline-venv`). |
+| `CHATTERBOX_UPSTREAM_REF` | `setup_baseline.sh` | Tag / commit / branch of upstream (default `master`). |
 
-### Офлайн-режим: загрузка весов локально
+### Offline mode: local weights
 
-При нестабильном или заблокированном доступе к Hugging Face загрузите веса один раз:
+When Hugging Face access is unstable or blocked, download the weights
+once:
 
 ```bash
-# Загрузить обе модели (~5–8 ГБ) в ~/.local/share/chatterbox-models/
+# Download both models (~5–8 GB) into ~/.local/share/chatterbox-models/
 uv run python download_models.py
 
-# Или в произвольную директорию
+# Or into a custom directory
 uv run python download_models.py --output-dir /data/models
 
-# Только MTL или только Turbo
+# Only MTL or only Turbo
 uv run python download_models.py --model mtl
 uv run python download_models.py --model turbo
 
-# Скрипт выведет строки export — добавьте их в ~/.bashrc / ~/.zshrc
+# The script prints export lines — append them to ~/.bashrc / ~/.zshrc
 export CHATTERBOX_MTL_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox
 export CHATTERBOX_TURBO_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox-turbo
 ```
 
-После этого все бенчмарки и `verify_regression.py` автоматически используют локальные веса.
-Для upstream-baseline переменные `CHATTERBOX_MTL_MODEL_DIR` / `CHATTERBOX_TURBO_MODEL_DIR`
-также прокидываются в воркер-subprocess.
+From that point on, every benchmark and `verify_regression.py`
+automatically uses the local weights. The variables
+`CHATTERBOX_MTL_MODEL_DIR` / `CHATTERBOX_TURBO_MODEL_DIR` are also
+forwarded into the upstream-baseline subprocess workers.
 
-### Подготовка upstream baseline одной командой
+### Bootstrap the upstream baseline in one command
 
 ```bash
 bash setup_baseline.sh
-export CHATTERBOX_REGRESSION_BASELINE_PYTHON=<путь из вывода скрипта>
+export CHATTERBOX_REGRESSION_BASELINE_PYTHON=<path printed by the script>
 ```
 
 ---
 
-## Сохранение результатов
+## Persisted results
 
-Каждый прогон `benchmark_cuda.py` и `benchmark_rtf.py` автоматически сохраняет JSON в `benchmarks/results/`:
+Every run of `benchmark_cuda.py` and `benchmark_rtf.py` writes a JSON
+file into `benchmarks/results/`:
 
 ```
 benchmarks/results/
@@ -112,7 +121,7 @@ benchmarks/results/
   2026-05-14T23-59-00_abc1234_rtf.json
 ```
 
-Структура файла:
+File structure:
 
 ```json
 {
@@ -124,7 +133,7 @@ benchmarks/results/
 }
 ```
 
-Для загрузки истории прогонов в скрипте:
+History is loadable from Python:
 
 ```python
 from benchmarks._results import load_history
@@ -135,21 +144,23 @@ for record in load_history("rtf"):
 
 ---
 
-## Архитектурное ограничение воркеров
+## Architectural constraint on the baseline workers
 
-Файлы `_baseline_waveform_worker.py` и `_baseline_timing_worker.py` запускаются
-**под интерпретатором из upstream-venv** (`CHATTERBOX_REGRESSION_BASELINE_PYTHON`).
-В этом окружении пакет `benchmarks` форка физически отсутствует.
+The files `_baseline_waveform_worker.py` and `_baseline_timing_worker.py`
+are spawned **under the upstream-venv interpreter**
+(`CHATTERBOX_REGRESSION_BASELINE_PYTHON`). In that environment the
+fork's `benchmarks` package physically does not exist.
 
-**Поэтому они намеренно не импортируют ничего из форка**, включая `benchmarks._utils`.
-Дублирование `set_seed` и `gc`-логики в этих файлах — осознанный компромисс,
-а не техдолг. Не нужно «исправлять» это дублирование.
+**Therefore they intentionally do not import anything from the fork**,
+including `benchmarks._utils`. The duplication of `set_seed` and
+gc-related logic inside these files is a deliberate compromise, not
+technical debt. Do not "fix" it.
 
 ---
 
-## Добавление нового бенчмарка
+## Adding a new benchmark
 
-1. Создать `benchmarks/my_bench.py` — использовать примитивы из `_utils.py`.
-2. Сохранять результаты через `from benchmarks._results import save; save("my_bench", data)`.
-3. Добавить корневой wrapper `benchmark_my_bench.py` из двух строк.
-4. Задокументировать в этом README.
+1. Create `benchmarks/my_bench.py` and use primitives from `_utils.py`.
+2. Persist results via `from benchmarks._results import save; save("my_bench", data)`.
+3. Add a two-line root wrapper `benchmark_my_bench.py`.
+4. Document it in this README.

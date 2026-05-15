@@ -1,175 +1,216 @@
-# AGENTS.md — Контекст ИИ-разработчика (Fork: Chatterbox)
+# AGENTS.md — Fork Working Context
 
-## Краткое описание проекта
+This file is the **process / policy** contract for working in this repo.
+For architecture, dataflow, lifecycles of caches and graphs, known bugs,
+and non-obvious design decisions, read [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-Этот репозиторий — форк оригинального **Chatterbox TTS** от Resemble AI.
-Проект предназначен для высокопроизводительного, мультиязычного синтеза речи (TTS) и конверсии голоса с ультранизкой задержкой (Streaming Mode).
-Основной фокус форка — глубокие оптимизации инференса на GPU NVIDIA для использования моделей в production-агентах реального времени.
+The two documents do not duplicate each other. AGENTS.md tells you
+**how to work**; ARCHITECTURE.md tells you **how the code is shaped and why**.
 
 ---
 
-## Окружение и Hardware
+## Project
 
-### Требования к среде
-- **GPU**: NVIDIA (архитектура Ampere и новее рекомендуется для стабильных CUDA Graphs). Минимум 8 ГБ VRAM (12+ ГБ для батчей > 2).
-- **CUDA**: Строго 12.8 (совместимость с жестко закрепленными версиями `nvidia-*` в `pyproject.toml`).
-- **Python**: 3.12+
+This repository is a fork of **Chatterbox TTS** by Resemble AI, focused on
+high-performance NVIDIA GPU inference for low-latency real-time agents:
+CUDA Graphs for the T3 autoregressive decode loop, a CUDA Graph for the
+S3Gen flow-matching estimator, and a streaming pipeline with stateful
+vocoder and prompt caching.
 
-### Быстрый старт
-Для подготовки окружения используйте `uv`:
+---
+
+## Environment
+
+- **GPU**: NVIDIA, Ampere or newer recommended for stable CUDA Graphs.
+  Minimum 8 GB VRAM (12+ GB for batches > 2).
+- **CUDA**: 12.8 strictly (hard-pinned by `nvidia-*` deps in
+  [`pyproject.toml`](pyproject.toml)).
+- **Python**: 3.12+.
+- **Package manager**: [`uv`](https://github.com/astral-sh/uv), not pip.
+
+Bootstrap from `chatterbox/`:
+
 ```bash
 uv sync --frozen
 ```
-Это гарантирует установку зависимостей в соответствии с `uv.lock` без попыток обновления версий.
+
+`--frozen` installs strictly from `uv.lock` without any version drift.
+All scripts are launched as `uv run python ...`.
 
 ---
 
-## Карта кода
+## Public entry points (asymmetric!)
 
-Пути от корня репозитория `chatterbox/`:
+| Class | Module | T3 backbone | `use_cuda_graph` | `generate_streaming` |
+|---|---|---|---|---|
+| `ChatterboxTTS` (EN) | [`src/chatterbox/tts.py`](src/chatterbox/tts.py) | GPT-2 medium + learned speech pos-emb | **NO** (not wired) | synchronous |
+| `ChatterboxTurboTTS` (EN) | [`src/chatterbox/tts_turbo.py`](src/chatterbox/tts_turbo.py) | GPT-2 medium (Turbo config) | yes, `T3Graph(batch_size=1)` | synchronous |
+| `ChatterboxMultilingualTTS` (23 languages incl. RU) | [`src/chatterbox/mtl_tts.py`](src/chatterbox/mtl_tts.py) | Llama_520M | yes, `T3Graph(batch_size=2)` + `S3GenGraph` | threaded |
 
-| Область | Пути |
-|--------|------|
-| Публичный API TTS | `src/chatterbox/tts.py` (`ChatterboxTTS`), `src/chatterbox/tts_turbo.py` (`ChatterboxTurboTTS`), `src/chatterbox/mtl_tts.py` (`ChatterboxMultilingualTTS`) |
-| T3 и оптимизации | `src/chatterbox/models/t3/t3.py`, `src/chatterbox/models/t3/t3_graph.py`, `src/chatterbox/models/t3/inference/t3_hf_backend.py` |
-| Аудио-декодер (токены → звук) | `src/chatterbox/models/s3gen/` (`s3gen.py`, `flow*.py`, `hifigan.py` и др.); стриминг: `src/chatterbox/models/s3gen/s3gen_streamer.py` (`S3GenStreamer`) |
-| Токенизация текста | `src/chatterbox/models/s3tokenizer/` |
-| Voice conversion | `src/chatterbox/vc.py`, `src/chatterbox/models/voice_encoder/` |
-| Примеры и UI | `example_streaming.py`, `gradio_*.py`, `multilingual_app.py` в корне репозитория |
+Notes:
 
-**`T3Graph` и batch:** при `use_cuda_graph=True` для `ChatterboxMultilingualTTS` в `mtl_tts.py` создаётся `T3Graph(..., batch_size=2)` (ветка CFG: условный и безусловный forward в одном батче). Для `ChatterboxTurboTTS` в `tts_turbo.py` — `batch_size=1`.
+- `ChatterboxTurboTTS` is **not** re-exported from
+  [`src/chatterbox/__init__.py`](src/chatterbox/__init__.py); import as
+  `from chatterbox.tts_turbo import ChatterboxTurboTTS`.
+- The three classes are intentionally **not** symmetric. Do not assume
+  features present in one class are present in the others (most notably:
+  `ChatterboxTTS` has no CUDA Graph wiring and no `skip_watermark`).
 
 ---
 
-## Архитектура инференса (после оптимизаций)
+## Read before editing
 
-**Пайплайн данных:** текст проходит лингвистическую и аудио-токенизацию (S3Tokenizer и код в `models/s3tokenizer`). Далее **T3** — авторегрессивная модель на базе GPT-2 / Llama, выдающая аудио-токены; интеграция с Hugging Face реализована в `t3_hf_backend`. Затем **S3Gen** (flow-matching, HiFT-GAN и связанные модули) преобразует токены в волновую форму.
+Read [`ARCHITECTURE.md`](ARCHITECTURE.md) **before** touching any of:
 
-**Оптимизированный путь T3:** на prefill используется стандартный проход с кэшем; затем KV переносится в **`StaticCache`** из `transformers`. На шаге decode одного токена при `use_cuda_graph=True` выполняется **`T3Graph`**: заранее захваченный CUDA graph воспроизводится через `replay`, статические буферы для входов/выходов; маски внимания и позиции подготовлены так, чтобы не выполнять тяжёлую логику на CPU внутри горячего цикла (подробности — в walkthrough по CUDA graphs).
+- [`src/chatterbox/models/t3/t3_graph.py`](src/chatterbox/models/t3/t3_graph.py) — T3 CUDA Graph
+- [`src/chatterbox/models/s3gen/s3gen_graph.py`](src/chatterbox/models/s3gen/s3gen_graph.py) — S3Gen estimator CUDA Graph
+- [`src/chatterbox/models/s3gen/s3gen_streamer.py`](src/chatterbox/models/s3gen/s3gen_streamer.py) — streaming with prompt cache + stateful vocoder
+- [`src/chatterbox/utils/streaming_utils.py`](src/chatterbox/utils/streaming_utils.py) — `ThreadedS3GenStreamer` (MTL streaming)
+- `generate_streaming` of any of the three `*_tts.py` files
+- [`src/chatterbox/models/s3gen/flow_matching.py`](src/chatterbox/models/s3gen/flow_matching.py) — CFM ODE start (`z = zeros_like(mu)` is intentional)
+- [`src/chatterbox/models/t3/t3.py`](src/chatterbox/models/t3/t3.py) inference loops (decode hot path)
 
-**Streaming:** на стороне T3 используются генераторы вроде `inference_stream` в `t3.py` — токены отдаются по одному, при этом decode-шаг совместим с тем же graph-путём, что и нестриминговый режим. Класс **`S3GenStreamer`** накапливает декод с окном и lookahead, чтобы чанки аудио стыковались без щелчков (см. walkthrough по streaming).
+These files encode invariants and historical bug fixes that are not
+inferrable from the code alone.
 
-**CFG (мультиязычность):** ускорение завязано не на «два независимых вызова модели подряд», а на совместной обработке условного и безусловного прохода в рамках конфигурации `T3Graph` с `batch_size=2` в `ChatterboxMultilingualTTS`.
+---
 
-```mermaid
-flowchart LR
-  textNode[Text] --> tokNode[Tokenization]
-  tokNode --> t3Node[T3]
-  t3Node --> s3Node[S3Gen]
-  s3Node --> wavNode[Waveform]
+## Hard rules (do not violate)
+
+1. **Do not change version pins** in `pyproject.toml` without an explicit
+   user request:
+   - `torch==2.10.0`, `torchaudio==2.10.0`
+   - `transformers==4.57.3`
+   - `nvidia-cuda-runtime-cu12==12.8.90`, `nvidia-cublas-cu12==12.8.4.1`
+   - `requires-python>=3.12`
+
+   The `[[tool.uv.index]] pytorch-cu128` block and the corresponding
+   `[tool.uv.sources]` mapping for `torch` / `torchaudio` must stay.
+
+2. **No CPU/GPU sync inside the decode hot loop**: no `.item()`, no
+   `.tolist()`, no `print`, no Python-side conditionals on tensor values
+   between `graph.replay()` calls. Any of these voids CUDA Graph replay.
+
+3. **`StaticCache` discipline**: single allocation up to `max_seq_len`
+   (default 2048), `.reset()` before every new prefill. Raising
+   `max_seq_len` grows VRAM linearly.
+
+4. **CFG (multilingual)** must be served by a single `T3Graph` with
+   `batch_size=2` (conditional + unconditional in one batch). Do not
+   split into two separate graphs.
+
+5. **`generate_streaming` API is public**. New parameters must have
+   defaults that preserve current behaviour.
+
+6. **CFM ODE start**: the fork uses
+   `z = torch.zeros_like(mu)` (see
+   [`src/chatterbox/models/s3gen/flow_matching.py:212`](src/chatterbox/models/s3gen/flow_matching.py)).
+   This is deterministic and CUDA-Graph-friendly. Do not revert to
+   `randn`. It breaks bit-parity with upstream by design — that is why
+   `verify_regression.py` uses *relative* metrics, not bit-equality.
+
+7. **Add dependencies via `pyproject.toml`** and the existing uv policy.
+   Do not suggest replacing uv with pip, and do not bypass the explicit
+   PyTorch CUDA 12.8 index.
+
+---
+
+## Verification
+
+Run from the `chatterbox/` directory via `uv run`.
+
+### 1. `verify_regression.py` — three independent phases
+
+Each phase runs in its own subprocess so VRAM is fully released between
+phases.
+
+| Phase | What it checks | Pass criterion |
+|---|---|---|
+| `mtl_ru` | Fork-internal parity: `use_cuda_graph=False` vs `True` | MSE < 1e-3 |
+| `upstream_quality` | Quality vs upstream `resemble-ai/chatterbox` | SQUIM-STOI ≥ 0.55 **and** ≥ baseline − 0.1; WER fork ≤ max(35%, WER_base + 15 pp); MCD informational |
+| `streaming` | Streaming quality vs full generation | SQUIM-STOI ≥ 0.55; length within ±5% of full generation; MSE informational |
+
+- `upstream_quality` is **SKIPPED** if `CHATTERBOX_REGRESSION_BASELINE_PYTHON`
+  is unset. Prepare the baseline venv once:
+  ```bash
+  bash setup_baseline.sh
+  export CHATTERBOX_REGRESSION_BASELINE_PYTHON=<path printed by the script>
+  ```
+- Debug a single phase in one process:
+  ```bash
+  CHATTERBOX_REGRESSION_INPROC=1 uv run python verify_regression.py
+  ```
+- Run a single phase:
+  ```bash
+  uv run python verify_regression.py mtl_ru
+  uv run python verify_regression.py upstream_quality
+  uv run python verify_regression.py streaming
+  ```
+
+What the "informational" metrics mean:
+
+- **Streaming MSE** ≈ 0.026 is **normal**, not a regression.
+  `S3GenStreamer` uses prompt caching and a stateful vocoder (`last_s`);
+  bit-parity with `generate()` is structurally impossible. SQUIM-STOI is
+  the real quality gate.
+- **MCD** without DTW alignment, between two systems with different ODE
+  starts, is always 20–40 dB regardless of audio quality. Useful as a
+  smoke test only.
+- **WER** threshold is relative because Whisper makes the same kinds of
+  errors on hard Russian words for both the fork and the baseline.
+
+### 2. `benchmark_cuda.py` — full-generation time, TTFC, peak VRAM
+
+Optional speedup-vs-upstream column when
+`CHATTERBOX_REGRESSION_BASELINE_PYTHON` is set.
+
+### 3. `benchmark_rtf.py` — streaming RTF, TTFC p50/p95, per-chunk decode
+
+Must stay below 1.0 for `ChatterboxMultilingualTTS` on the documented
+text fixtures.
+
+### Benchmark results
+
+All benchmark runs persist JSON in `benchmarks/results/` tagged with git
+commit and GPU model. Browse history with
+`benchmarks._results.load_history(...)`. See
+[`benchmarks/README.md`](benchmarks/README.md) for the full surface.
+
+### Offline weights (no Hugging Face at runtime)
+
+```bash
+uv run python download_models.py
+export CHATTERBOX_MTL_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox
+export CHATTERBOX_TURBO_MODEL_DIR=~/.local/share/chatterbox-models/chatterbox-turbo
 ```
 
-Ниже в разделе «Core-оптимизации» перечислены инварианты, которые нельзя нарушать при правках; этот раздел задаёт *где* в коде это живёт.
+---
+
+## Pre-PR checklist
+
+- [ ] No edits to version pins in `pyproject.toml`.
+- [ ] If T3 was touched, `T3Graph` static buffer shapes still match the
+      model: `input_buf` uses `hidden_size`, `logits_buf` uses
+      `speech_tokens_dict_size`.
+- [ ] If the S3Gen estimator was touched, `S3GenGraph` static buffer
+      shapes (`B=2`, `max_frames`) still match the new estimator I/O.
+- [ ] The decode hot path has no `.item()` / `.tolist()` / `print` /
+      Python branch on tensor values.
+- [ ] `verify_regression.py` passes: `mtl_ru` (MSE < 1e-3) and `streaming`
+      green; `upstream_quality` either green or SKIPPED.
+- [ ] `StaticCache.reset()` is called before every new prefill.
+- [ ] No new `randn` introduced into the CFM ODE start.
 
 ---
 
-## Документация для разработчиков (walkthrough)
+## Troubleshooting
 
-Читать **до** правок в соответствующей подсистеме:
-
-- [`agent-docs/cuda-graphs-optimization-walkthrough.md`](agent-docs/cuda-graphs-optimization-walkthrough.md) — `StaticCache`, жизненный цикл `T3Graph` (prefill → копирование KV → decode через graph), маскирование, **эталонные таблицы** времени полной генерации (Turbo EN и MTL RU, baseline vs оптимизированная версия).
-- [`agent-docs/streaming-walkthrough.md`](agent-docs/streaming-walkthrough.md) — методы `generate_streaming`, TTFC, связка T3-streaming + `S3GenStreamer`, проверки согласованности с полной генерацией.
-- [`agent-docs/streaming-performance-optimization.md`](agent-docs/streaming-performance-optimization.md) — кеширование промпта (prompt caching), состояние вокодера (stateful vocoder) и отключение водяных знаков для достижения RTF < 1.0.
-
-Перед изменениями в `t3_graph.py`, цикле decode или кэше — cuda-graphs walkthrough. Перед изменениями в `generate_streaming`, `S3GenStreamer` или chunked API — streaming walkthrough.
-
----
-
-## Менеджер пакетов: uv
-
-В проекте зависимости задаются в [`pyproject.toml`](pyproject.toml) и предполагается использование **[uv](https://github.com/astral-sh/uv)**.
-
-- В `pyproject.toml` настроены `[[tool.uv.index]]` с именем `pytorch-cu128` (URL `https://download.pytorch.org/whl/cu128`, `explicit = true`) и `[tool.uv.sources]`: пакеты `torch` и `torchaudio` берутся **только** с этого индекса.
-- Рекомендуемый рабочий цикл из каталога `chatterbox/`: `uv sync`. Запуск скриптов верификации: `uv run python verify_regression.py`.
-
-**Правило для ИИ-агента:** не предлагать замену uv на «проще через pip» без веской причины; не обходить явный индекс PyTorch; новые зависимости добавлять через `pyproject.toml` и политику uv, а не размытыми командами вроде `pip install <latest>`.
-
----
-
-## Версии в pyproject — не трогать
-
-Следующие и **связанные с ними жёсткие пины** в [`pyproject.toml`](pyproject.toml) задают совместимость CUDA graphs, API `transformers`, ABI и воспроизводимость инференса:
-
-- `requires-python = ">=3.12"`
-- `torch==2.10.0`, `torchaudio==2.10.0` (согласованная пара)
-- `transformers==4.57.3`
-- CUDA 12.8: `nvidia-cuda-runtime-cu12==12.8.90`, `nvidia-cublas-cu12==12.8.4.1`
-
-**Правило:** эти версии **не изменять вообще** без **явного, недвусмысленного запроса пользователя**. Агент не должен сам «обновлять» зависимости. Если пользователь **явно** потребовал смену версий — только тогда, и обязательно с полным прогоном верификации.
-
----
-
-## Верификация изменений
-
-Запуск из каталога `chatterbox/` (предпочтительно через `uv run python …`).
-
-1. **`verify_regression.py`**: Три независимые фазы, каждая — отдельный подпроцесс (сброс VRAM).
-
-   | Фаза | Что проверяет | Метрика / Порог |
-   |------|--------------|-----------------|
-   | `mtl_ru` | Паритет CUDA graphs: `use_cuda_graph=False` vs `True` | MSE < 1e-3 |
-   | `upstream_quality` | Деградация качества vs upstream resemble-ai/chatterbox | SQUIM-STOI ≥ 0.55 (fork и не хуже base на 0.1); WER fork ≤ max(35%, WER base + 15 п.п.); MCD — информационно |
-   | `streaming` | Качество стримингового аудио | SQUIM-STOI ≥ 0.55; длина в пределах ±5% от полной генерации; MSE — информационно |
-
-   `upstream_quality` пропускается (SKIP) если `CHATTERBOX_REGRESSION_BASELINE_PYTHON` не задан.
-   Подготовка upstream-venv: `bash setup_baseline.sh && export CHATTERBOX_REGRESSION_BASELINE_PYTHON=<путь>`.
-
-   Отладка в одном процессе: `CHATTERBOX_REGRESSION_INPROC=1 uv run python verify_regression.py`.
-   Одна фаза вручную: `uv run python verify_regression.py mtl_ru` (или `upstream_quality`, `streaming`).
-
-   > **Примечание по ODE-шуму**: форк намеренно использует `z = torch.zeros_like(mu)` вместо `randn`
-   > для детерминированности CUDA graphs. Из-за этого побитовое совпадение с upstream невозможно.
-   > **MCD** без DTW-выравнивания между системами с разными ODE-стартами всегда 20–40 dB независимо
-   > от качества — метрика выводится информационно и не входит в pass/fail.
-   > **WER** проверяется относительно: fork ≤ max(35%, WER baseline + 15 п.п.) — это нейтрализует
-   > ошибки Whisper на сложных русских словах (одинаковые у обоих систем).
-   >
-   > **Примечание по streaming MSE**: `S3GenStreamer` использует prompt caching (раздельное кодирование
-   > промпта для RTF) и stateful vocoder (`last_s`, для бесшовных переходов между чанками). Из-за этих
-   > оптимизаций MSE между streaming и `generate()` ≈ 0.026 — норма, не регрессия. Критерием качества
-   > стриминга служит SQUIM-STOI ≥ 0.55 и совпадение длины ±5%.
-
-2. **`benchmark_cuda.py`**: Замер времени `generate` и TTFC. Не допускать относительной просадки FPS.
-3. **`verify_update.py`**: Сквозная проверка (TTS + Whisper). Семантическое соответствие текста.
-
----
-
-## Внедрённые Core-оптимизации (ВАЖНО)
-
-При генерации или изменении кода инференса ИИ обязан строго следовать этим правилам:
-
-1. **Static KV-Cache (`StaticCache`)**:
-   * **Инвариант:** Исключить динамические аллокации памяти во время генерации.
-   * **Ограничение:** `StaticCache` жестко аллоцирует память под `max_seq_len` при создании. Увеличение этого параметра повышает потребление VRAM.
-
-2. **Захват CUDA Graphs (`T3Graph`)**:
-   * **Инвариант:** Внутри цикла генерации (между `graph.replay()`) запрещены любые операции, вызывающие синхронизацию CPU/GPU: `.item()`, `.tolist()`, `print()`, условия на значениях тензоров.
-   * **Ограничение:** Любое изменение архитектуры `tfmr` (T3) требует обновления логики в `T3Graph._decode_step()`.
-
-3. **Classifier-Free Guidance (CFG)**:
-   * **Инвариант:** Для Multilingual использовать `batch_size=2` в графах. Не разделять проходы на два графа, это убьет производительность.
-
-4. **Streaming Mode**:
-   * **Инвариант:** Сохранять обратную совместимость с `generate_streaming`. Новые аргументы API должны иметь значения по умолчанию.
-
----
-
-## Чек-лист для ИИ-агента (перед PR)
-
-> [!IMPORTANT]
-> Перед выполнением любых правок в логике инференса убедитесь, что:
-
-- [ ] Вы не изменили версии в `pyproject.toml`.
-- [ ] Изменения в модели T3 отражены в `src/chatterbox/models/t3/t3_graph.py` (статические буферы, размерность логитов).
-- [ ] В "горячем цикле" генерации не появилось вызовов, блокирующих CUDA Graph.
-- [ ] Прогнан `uv run python verify_regression.py`: фаза `mtl_ru` (MSE < 1e-3) и `streaming` прошли; `upstream_quality` не упала ниже порогов (SQUIM-STOI / WER относительный).
-- [ ] `StaticCache` корректно сбрасывается (`.reset()`) перед новым prefill.
-
----
-
-## Troubleshooting (Типичные проблемы)
-
-- **"Illegal memory access" после изменения T3**: Скорее всего, размер буфера `logits_buf` или `input_buf` в `T3Graph` больше не соответствует выходным тензорам модели.
-- **Производительность упала до уровня baseline**: Проверьте, не вызывается ли `capture()` на каждом шаге. Граф должен захватываться один раз при инициализации.
-- **`uv sync` падает с ошибкой индекса**: Убедитесь, что вы не удалили `[[tool.uv.index]]` из `pyproject.toml`. PyTorch для CUDA 12.8 берется с отдельного URL.
-- **OOM (Out of Memory)**: Проверьте `max_seq_len` в конфиге. Для `batch_size=2` и длинных контекстов потребление памяти растет линейно.
+- **"Illegal memory access" after editing T3** — the size of `input_buf` or
+  `logits_buf` in `T3Graph` no longer matches the model's tensors.
+- **Performance regressed to baseline** — `T3Graph.capture()` is probably
+  being called per step. Capture must happen once, at model init.
+- **`uv sync` fails on index** — the `[[tool.uv.index]] pytorch-cu128`
+  block was removed or corrupted. PyTorch CUDA 12.8 wheels come from
+  that index only.
+- **OOM** — check `max_seq_len` in `T3Graph` / `StaticCache`. With
+  `batch_size=2` (MTL) the cache cost is doubled.
